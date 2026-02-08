@@ -7,7 +7,10 @@ import { Button } from "@/components/ui/Button";
 import { StatusIndicator } from "@/components/ui/StatusIndicator";
 import { ReviewerCard } from "@/components/workspace/ReviewerCard";
 import type {
+  CapacityState,
+  DecisionLogEvent,
   Doer,
+  EscalationState,
   Reviewer,
   ReviewResultFE,
   ReviewSummaryFE,
@@ -40,6 +43,9 @@ interface RightPanelProps {
   onRecoverToActive?: () => void;
   isRecoveringToActive?: boolean;
   onSetRolloutMode?: (mode: "baseline" | "shadow" | "active") => void;
+  decisionLog?: DecisionLogEvent[];
+  escalation?: EscalationState | null;
+  capacity?: CapacityState | null;
   crewDoers?: Doer[];
   crewReviewers?: Reviewer[];
 }
@@ -62,6 +68,17 @@ function rolloutSourceLabel(source: RolloutHistoryEvent["source"]): string {
   if (source === "migration") return "legacy migration";
   if (source === "hydrate") return "state hydration";
   return "project init";
+}
+
+function decisionTypeLabel(type: DecisionLogEvent["decision_type"]): string {
+  if (type === "review_cycle") return "review";
+  if (type === "escalation_opened") return "escalated";
+  if (type === "escalation_resolved") return "resolved";
+  if (type === "capacity_queue") return "queued";
+  if (type === "capacity_override") return "override";
+  if (type === "route_change") return "route";
+  if (type === "fallback") return "fallback";
+  return type.replaceAll("_", " ");
 }
 
 function deterministicEmoji(seed: string, pool: string[]): string {
@@ -160,6 +177,9 @@ export function RightPanel({
   onRecoverToActive,
   isRecoveringToActive = false,
   onSetRolloutMode,
+  decisionLog = [],
+  escalation = null,
+  capacity = null,
   crewDoers = [],
   crewReviewers = [],
 }: RightPanelProps) {
@@ -175,6 +195,7 @@ export function RightPanel({
   const sourceConfidence = deriveSourceConfidence(reviewResults);
   const evidenceWarningCount = countEvidenceWarnings(reviewResults);
   const concordiaStatus = concordiaHealthLabel(shadowReview);
+  const recentDecisions = decisionLog.slice(0, 4);
 
   return (
     <div className="w-72 flex-shrink-0 border-l border-[var(--glass-border)] bg-[var(--carbon)]/50 flex flex-col overflow-hidden">
@@ -535,6 +556,58 @@ export function RightPanel({
             </div>
           </div>
         )}
+
+        <div className="mb-3 pb-3 border-b border-[var(--glass-border)]">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
+              Ops Rails
+            </span>
+            <span
+              className={`text-[10px] ${
+                escalation?.status === "open"
+                  ? escalation.level === "L2"
+                    ? "text-[var(--coral)]"
+                    : "text-[var(--amber)]"
+                  : "text-[var(--phosphor)]"
+              }`}
+            >
+              {escalation?.status === "open" ? `${escalation.level} Open` : "Stable"}
+            </span>
+          </div>
+          <div className="space-y-1 text-[10px] text-[var(--smoke)]">
+            <div className="flex items-center justify-between">
+              <span className="text-[var(--ash)]">Reviewer budget</span>
+              <span>
+                {(capacity?.reviewerRunsCurrentDraft ?? 0)}/{capacity?.maxReviewerRunsPerDraft ?? 5}
+              </span>
+            </div>
+            <div className="flex items-center justify-between">
+              <span className="text-[var(--ash)]">Queue depth</span>
+              <span>{capacity?.queueDepth ?? 0}</span>
+            </div>
+            {escalation?.status === "open" && (
+              <p className="text-[var(--amber)]">
+                {escalation.reason} Recommended: {escalation.recommended_action}
+              </p>
+            )}
+          </div>
+          {recentDecisions.length > 0 && (
+            <div className="mt-2 border-t border-[var(--zinc)]/50 pt-2">
+              <div className="mb-1 text-[10px] text-[var(--ash)]">Latest decisions</div>
+              <div className="space-y-1">
+                {recentDecisions.map((event) => (
+                  <div key={event.id} className="rounded border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1">
+                    <div className="flex items-center justify-between text-[10px] text-[var(--smoke)]">
+                      <span>{decisionTypeLabel(event.decision_type)}</span>
+                      <span className="text-[var(--ash)]">{formatRolloutTime(event.timestamp)}</span>
+                    </div>
+                    <div className="text-[10px] text-[var(--ash)]">{event.reason}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
 
         {/* Shadow comparison */}
         {onRunShadowReview && (

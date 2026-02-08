@@ -2,7 +2,13 @@
 
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
-import { useAppStore, type Project } from "@/lib/store";
+import {
+  useAppStore,
+  type EscalationState,
+  type Project,
+  type ReviewResultFE,
+  type ReviewSummaryFE,
+} from "@/lib/store";
 import { Header } from "@/components/layout/Header";
 import { Sidebar } from "@/components/layout/Sidebar";
 import { Editor } from "@/components/workspace/Editor";
@@ -42,6 +48,59 @@ function promoteStrictness(
   return "high";
 }
 
+const DEFAULT_CAPACITY_POLICY = {
+  maxConcurrentDoers: 3,
+  maxReviewerRunsPerDraft: 5,
+  reviewerRunsCurrentDraft: 0,
+  queueDepth: 0,
+};
+
+function countCriticalIssues(results: ReviewResultFE[]): number {
+  let total = 0;
+  for (const result of results) {
+    total += result.annotations.filter((annotation) => annotation.severity === "critical").length;
+  }
+  return total;
+}
+
+function buildEscalationFromReview(
+  summary: ReviewSummaryFE,
+  results: ReviewResultFE[]
+): EscalationState | null {
+  const criticalCount = countCriticalIssues(results);
+  if (criticalCount >= 3) {
+    return {
+      level: "L2",
+      trigger: "low_source_confidence",
+      reason: `${criticalCount} critical issues found in this review run.`,
+      recommended_action: "Pause and verify claims before any external action.",
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+  }
+  if (summary.conflictsDetected > 0) {
+    return {
+      level: "L1",
+      trigger: "review_conflict",
+      reason: `${summary.conflictsDetected} reviewer conflict(s) detected.`,
+      recommended_action: "Review conflicting notes and approve the next revision path.",
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+  }
+  if (summary.overallScore < 6 || summary.totalIssues >= 8) {
+    return {
+      level: "L1",
+      trigger: "low_source_confidence",
+      reason: `Review score ${summary.overallScore.toFixed(1)}/10 with ${summary.totalIssues} issues.`,
+      recommended_action: "Request revision and rerun review before publish/share.",
+      status: "open",
+      created_at: new Date().toISOString(),
+    };
+  }
+  return null;
+}
+
 export default function Home() {
   const router = useRouter();
   const {
@@ -64,6 +123,9 @@ export default function Home() {
     setGlobalActivity,
     addLlmTelemetryEvent,
     addHubEvent,
+    appendDecisionLog,
+    setProjectEscalation,
+    setProjectCapacity,
   } = useAppStore();
 
   const selectedProject: Project | undefined = useMemo(
@@ -95,6 +157,20 @@ export default function Home() {
     if (!legacyProjects.length) return;
     for (const project of legacyProjects) {
       updateProject(project.id, { rolloutMode: "baseline" });
+    }
+  }, [projects, updateProject]);
+
+  useEffect(() => {
+    const projectsMissingOps = projects.filter(
+      (project) => !project.capacity || project.decisionLog === undefined || project.escalation === undefined
+    );
+    if (!projectsMissingOps.length) return;
+    for (const project of projectsMissingOps) {
+      updateProject(project.id, {
+        capacity: project.capacity ?? { ...DEFAULT_CAPACITY_POLICY },
+        decisionLog: project.decisionLog ?? [],
+        escalation: project.escalation ?? null,
+      });
     }
   }, [projects, updateProject]);
 
@@ -286,6 +362,48 @@ export default function Home() {
     };
   }, [backendUrl, selectedProject, setGlobalActivity, updateProject]);
 
+  const appendProjectDecision = useCallback(
+    (
+      projectId: string,
+      event: Parameters<typeof appendDecisionLog>[1]
+    ) => {
+      appendDecisionLog(projectId, event);
+    },
+    [appendDecisionLog]
+  );
+
+  const openEscalation = useCallback(
+    (projectId: string, escalation: EscalationState) => {
+      setProjectEscalation(projectId, escalation);
+      appendProjectDecision(projectId, {
+        actor_type: "system",
+        actor_id: "ops_guard",
+        decision_type: "escalation_opened",
+        reason: escalation.reason,
+        impact_summary: `${escalation.level} escalation opened: ${escalation.recommended_action}`,
+        metadata: {
+          trigger: escalation.trigger,
+          level: escalation.level,
+        },
+      });
+    },
+    [appendProjectDecision, setProjectEscalation]
+  );
+
+  const resolveEscalation = useCallback(
+    (projectId: string, reason: string) => {
+      setProjectEscalation(projectId, null);
+      appendProjectDecision(projectId, {
+        actor_type: "system",
+        actor_id: "ops_guard",
+        decision_type: "escalation_resolved",
+        reason,
+        impact_summary: "Escalation resolved and project returned to normal flow.",
+      });
+    },
+    [appendProjectDecision, setProjectEscalation]
+  );
+
   const handleRunCommand = useCallback(async (prompt: string, model: string) => {
     if (!selectedProject) {
       notify.warning("No Project Selected", "Select a project before running a command.");
@@ -378,14 +496,37 @@ export default function Home() {
       .join("\n\n");
 
     const externalActionPattern = /\b(send|email|post|publish|export|share|notify)\b/i;
-    if (externalActionPattern.test(cleanPrompt) && typeof window !== "undefined") {
+    const hasExternalActionRequest = externalActionPattern.test(cleanPrompt);
+    if (hasExternalActionRequest && typeof window !== "undefined") {
+      openEscalation(selectedProject.id, {
+        level: "L2",
+        trigger: "external_action",
+        reason: "Command appears to trigger an external action.",
+        recommended_action: "Require explicit human confirmation before continuing.",
+        status: "open",
+        created_at: new Date().toISOString(),
+      });
       const confirmed = window.confirm(
         "This request may trigger an external action. Continue?"
       );
       if (!confirmed) {
+        appendProjectDecision(selectedProject.id, {
+          actor_type: "human",
+          actor_id: "current_user",
+          decision_type: "pause",
+          reason: "External action not approved.",
+          impact_summary: "Command execution cancelled before external side effects.",
+        });
         notify.info("Action Cancelled", "External action requires explicit confirmation.");
         return;
       }
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "override",
+        reason: "External action explicitly approved.",
+        impact_summary: "Command execution continued after manual approval.",
+      });
     }
 
     const targetNames = [...mentionedDoers.map((d) => d.name), ...mentionedReviewers.map((r) => r.name)];
@@ -464,6 +605,21 @@ export default function Home() {
           status: "completed",
         });
       }
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "system",
+        actor_id: "repl",
+        decision_type: "route_change",
+        reason: "Command executed in project REPL.",
+        impact_summary: `Processed prompt "${promptSummary}" using model ${model || "auto"}.`,
+        metadata: {
+          model: model || "auto",
+          targeted_doers: mentionedDoers.map((doer) => doer.id),
+          targeted_reviewers: mentionedReviewers.map((reviewer) => reviewer.id),
+        },
+      });
+      if (hasExternalActionRequest) {
+        resolveEscalation(selectedProject.id, "External action approval completed.");
+      }
 
       setIsRunning(false);
     } catch (error) {
@@ -473,7 +629,14 @@ export default function Home() {
         error instanceof Error ? error.message : "Failed to run command in REPL"
       );
     }
-  }, [addHubEvent, addLlmTelemetryEvent, selectedProject]);
+  }, [
+    addHubEvent,
+    addLlmTelemetryEvent,
+    appendProjectDecision,
+    openEscalation,
+    resolveEscalation,
+    selectedProject,
+  ]);
 
   const getProfileContext = useCallback(() => {
     if (onboarding.user_profile) {
@@ -611,7 +774,31 @@ export default function Home() {
       "Rollout Auto-Fallback",
       "Reviewer pipeline switched to shadow mode after an active-path failure."
     );
-  }, [selectedProject?.id, selectedProject?.rolloutHistory]);
+    openEscalation(selectedProject.id, {
+      level: "L2",
+      trigger: "auto_fallback",
+      reason: "Candidate reviewer path failed and auto-fallback was triggered.",
+      recommended_action: "Inspect fallback event, then approve recovery to active mode when safe.",
+      status: "open",
+      created_at: new Date().toISOString(),
+    });
+    appendProjectDecision(selectedProject.id, {
+      actor_type: "system",
+      actor_id: "rollout_guard",
+      decision_type: "fallback",
+      reason: latestEvent.reason || "automatic fallback",
+      impact_summary: "Rollout mode moved away from active due to candidate quality failure.",
+      metadata: {
+        mode: latestEvent.mode,
+        from_mode: latestEvent.from_mode,
+      },
+    });
+  }, [
+    appendProjectDecision,
+    openEscalation,
+    selectedProject?.id,
+    selectedProject?.rolloutHistory,
+  ]);
 
   // --- Review handlers ---
 
@@ -623,6 +810,50 @@ export default function Home() {
     const judgeIds = selectedProject.reviewers
       ?.filter((r) => r.enabled)
       .map((r) => r.id) ?? ["brand_consistency", "legal_compliance"];
+
+    const capacity = selectedProject.capacity ?? DEFAULT_CAPACITY_POLICY;
+    const nextRunCount = (capacity.reviewerRunsCurrentDraft || 0) + 1;
+    if (nextRunCount > capacity.maxReviewerRunsPerDraft) {
+      const allowOverride =
+        typeof window !== "undefined"
+          ? window.confirm(
+              `Reviewer run limit reached (${capacity.maxReviewerRunsPerDraft} per draft). Continue anyway?`
+            )
+          : false;
+      if (!allowOverride) {
+        setProjectCapacity(selectedProject.id, {
+          queueDepth: (capacity.queueDepth || 0) + 1,
+        });
+        appendProjectDecision(selectedProject.id, {
+          actor_type: "system",
+          actor_id: "capacity_guard",
+          decision_type: "capacity_queue",
+          reason: "Reviewer run budget exceeded for current draft.",
+          impact_summary: "Review run queued until user override or next draft reset.",
+          metadata: {
+            maxReviewerRunsPerDraft: capacity.maxReviewerRunsPerDraft,
+            attemptedRuns: nextRunCount,
+          },
+        });
+        notify.warning("Review Queued", "Reviewer run limit reached. Approve override to continue.");
+        return;
+      }
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "capacity_override",
+        reason: "User approved reviewer run beyond configured budget.",
+        impact_summary: "Review run continued beyond capacity policy.",
+        metadata: {
+          maxReviewerRunsPerDraft: capacity.maxReviewerRunsPerDraft,
+          attemptedRuns: nextRunCount,
+        },
+      });
+    }
+    setProjectCapacity(selectedProject.id, {
+      reviewerRunsCurrentDraft: nextRunCount,
+      queueDepth: Math.max(0, (capacity.queueDepth || 0) - 1),
+    });
 
     startReview();
 
@@ -638,6 +869,24 @@ export default function Home() {
       );
       setReviewResults(results, summary, conflicts);
       pushLlmMetaEvents(llmMeta);
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "reviewer",
+        actor_id: "reviewer_cycle",
+        decision_type: "review_cycle",
+        reason: "Completed full reviewer cycle.",
+        evidence_refs: results
+          .flatMap((result) => result.annotations)
+          .slice(0, 3)
+          .map((annotation) => annotation.id),
+        impact_summary: `Score ${summary.overallScore.toFixed(1)}/10 with ${summary.totalIssues} issue(s).`,
+      });
+
+      const escalation = buildEscalationFromReview(summary, results);
+      if (escalation) {
+        openEscalation(selectedProject.id, escalation);
+      } else if (selectedProject.escalation?.status === "open") {
+        resolveEscalation(selectedProject.id, "Latest review cycle returned to acceptable risk level.");
+      }
 
       // Show notification
       const issueCount = summary.totalIssues;
@@ -667,10 +916,22 @@ export default function Home() {
       console.error("Review failed:", err);
       clearReview();
       notify.error("Review Failed", err instanceof Error ? err.message : "Is the backend running?");
+      openEscalation(selectedProject.id, {
+        level: "L1",
+        trigger: "retry_exhausted",
+        reason: "Reviewer run failed unexpectedly.",
+        recommended_action: "Check backend health and retry review.",
+        status: "open",
+        created_at: new Date().toISOString(),
+      });
     } finally {
       void refreshRolloutHistory(selectedProject.id);
     }
   }, [
+    appendProjectDecision,
+    resolveEscalation,
+    openEscalation,
+    setProjectCapacity,
     selectedProject,
     startReview,
     setReviewResults,
@@ -685,6 +946,46 @@ export default function Home() {
     async (judgeId: string) => {
       const editor = editorRef.current;
       if (!editor || !selectedProject) return;
+
+      const capacity = selectedProject.capacity ?? DEFAULT_CAPACITY_POLICY;
+      const nextRunCount = (capacity.reviewerRunsCurrentDraft || 0) + 1;
+      if (nextRunCount > capacity.maxReviewerRunsPerDraft) {
+        const allowOverride =
+          typeof window !== "undefined"
+            ? window.confirm(
+                `Reviewer run limit reached (${capacity.maxReviewerRunsPerDraft} per draft). Continue anyway?`
+              )
+            : false;
+        if (!allowOverride) {
+          setProjectCapacity(selectedProject.id, {
+            queueDepth: (capacity.queueDepth || 0) + 1,
+          });
+          appendProjectDecision(selectedProject.id, {
+            actor_type: "system",
+            actor_id: "capacity_guard",
+            decision_type: "capacity_queue",
+            reason: `Single reviewer run queued for ${judgeId}.`,
+            impact_summary: "Reviewer budget exceeded for current draft.",
+            metadata: {
+              maxReviewerRunsPerDraft: capacity.maxReviewerRunsPerDraft,
+              attemptedRuns: nextRunCount,
+            },
+          });
+          notify.warning("Review Queued", "Reviewer run limit reached. Approve override to continue.");
+          return;
+        }
+        appendProjectDecision(selectedProject.id, {
+          actor_type: "human",
+          actor_id: "current_user",
+          decision_type: "capacity_override",
+          reason: `User approved extra reviewer run for ${judgeId}.`,
+          impact_summary: "Single reviewer run continued beyond capacity policy.",
+        });
+      }
+      setProjectCapacity(selectedProject.id, {
+        reviewerRunsCurrentDraft: nextRunCount,
+        queueDepth: Math.max(0, (capacity.queueDepth || 0) - 1),
+      });
 
       setRunningJudgeId(judgeId);
 
@@ -714,6 +1015,14 @@ export default function Home() {
             message: `Completed single review with score ${r.score.toFixed(1)}/10.`,
             status: r.annotations.length > 0 ? "warning" : "completed",
           });
+          appendProjectDecision(selectedProject.id, {
+            actor_type: "reviewer",
+            actor_id: r.judgeId,
+            decision_type: "review_cycle",
+            reason: "Completed single reviewer run.",
+            evidence_refs: r.annotations.slice(0, 3).map((annotation) => annotation.id),
+            impact_summary: `${r.judgeName} scored ${r.score.toFixed(1)}/10 with ${r.annotations.length} issue(s).`,
+          });
         }
       } catch (err) {
         console.error("Single reviewer run failed:", err);
@@ -728,9 +1037,11 @@ export default function Home() {
       setRunningJudgeId,
       updateSingleResult,
       addHubEvent,
+      appendProjectDecision,
       getProfileContext,
       pushLlmMetaEvents,
       refreshRolloutHistory,
+      setProjectCapacity,
     ]
   );
 
@@ -794,6 +1105,15 @@ export default function Home() {
         "Shadow Review Complete",
         `Agreement ${Math.round(response.comparison.decision_agreement_rate * 100)}% across ${response.comparison.pair_count} reviewer pairs`
       );
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "reviewer",
+        actor_id: "concordia_shadow",
+        decision_type: "review_cycle",
+        reason: "Completed shadow concordia comparison.",
+        impact_summary: `Agreement ${Math.round(
+          response.comparison.decision_agreement_rate * 100
+        )}% with mean score delta ${response.comparison.mean_score_delta.toFixed(2)}.`,
+      });
     } catch (err) {
       updateProject(selectedProject.id, {
         shadowReview: {
@@ -805,8 +1125,23 @@ export default function Home() {
         "Shadow Review Failed",
         err instanceof Error ? err.message : "Is the backend running?"
       );
+      openEscalation(selectedProject.id, {
+        level: "L1",
+        trigger: "retry_exhausted",
+        reason: "Shadow concordia run failed.",
+        recommended_action: "Retry shadow run or keep baseline reviewers active.",
+        status: "open",
+        created_at: new Date().toISOString(),
+      });
     }
-  }, [selectedProject, updateProject, getProfileContext, pushLlmMetaEvents]);
+  }, [
+    appendProjectDecision,
+    getProfileContext,
+    openEscalation,
+    pushLlmMetaEvents,
+    selectedProject,
+    updateProject,
+  ]);
 
   const handleSetRolloutMode = useCallback(
     async (mode: "baseline" | "shadow" | "active") => {
@@ -822,6 +1157,17 @@ export default function Home() {
         );
         await refreshRolloutHistory(selectedProject.id);
         notify.success("Rollout Mode Updated", `Project now running in ${mode} mode.`);
+        appendProjectDecision(selectedProject.id, {
+          actor_type: "human",
+          actor_id: "current_user",
+          decision_type: "route_change",
+          reason: `Rollout mode switched from ${previous} to ${mode}.`,
+          impact_summary: `Reviewer routing now uses ${mode} strategy.`,
+          metadata: { previous, next: mode },
+        });
+        if (mode === "active" && selectedProject.escalation?.status === "open") {
+          resolveEscalation(selectedProject.id, "Rollout manually set to active.");
+        }
       } catch (err) {
         updateProject(selectedProject.id, { rolloutMode: previous });
         notify.error(
@@ -830,7 +1176,13 @@ export default function Home() {
         );
       }
     },
-    [selectedProject, updateProject, refreshRolloutHistory]
+    [
+      appendProjectDecision,
+      refreshRolloutHistory,
+      resolveEscalation,
+      selectedProject,
+      updateProject,
+    ]
   );
 
   const handleRecoverToActive = useCallback(async () => {
@@ -849,6 +1201,16 @@ export default function Home() {
         "Recovery Complete",
         "Project returned to active rollout mode. Monitor next review runs closely."
       );
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "override",
+        reason: "Manual recovery to active rollout mode.",
+        impact_summary: "Project moved back to active mode after fallback.",
+      });
+      if (selectedProject.escalation?.status === "open") {
+        resolveEscalation(selectedProject.id, "Recovery to active mode completed.");
+      }
     } catch (err) {
       updateProject(selectedProject.id, { rolloutMode: previous });
       notify.error(
@@ -858,7 +1220,7 @@ export default function Home() {
     } finally {
       setIsRecoveringToActive(false);
     }
-  }, [selectedProject, refreshRolloutHistory, updateProject]);
+  }, [appendProjectDecision, refreshRolloutHistory, resolveEscalation, selectedProject, updateProject]);
 
   const handleAnnotationClick = useCallback(
     (annotationId: string) => {
@@ -1025,6 +1387,9 @@ export default function Home() {
           onRecoverToActive={handleRecoverToActive}
           isRecoveringToActive={isRecoveringToActive}
           onSetRolloutMode={handleSetRolloutMode}
+          decisionLog={selectedProject?.decisionLog || []}
+          escalation={selectedProject?.escalation || null}
+          capacity={selectedProject?.capacity || null}
         />
       )}
       </div>

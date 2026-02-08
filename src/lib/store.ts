@@ -77,6 +77,59 @@ export type ReviewState = {
   visibleJudgeIds: Set<string>;
 };
 
+export type EscalationLevel = "L0" | "L1" | "L2";
+
+export type EscalationTrigger =
+  | "review_conflict"
+  | "low_source_confidence"
+  | "external_action"
+  | "retry_exhausted"
+  | "auto_fallback";
+
+export type EscalationState = {
+  level: EscalationLevel;
+  trigger: EscalationTrigger;
+  reason: string;
+  recommended_action: string;
+  status: "open" | "resolved";
+  created_at: string;
+  resolved_at?: string;
+};
+
+export type DecisionType =
+  | "approve"
+  | "reject"
+  | "fallback"
+  | "override"
+  | "route_change"
+  | "pause"
+  | "resume"
+  | "review_cycle"
+  | "escalation_opened"
+  | "escalation_resolved"
+  | "capacity_queue"
+  | "capacity_override";
+
+export type DecisionLogEvent = {
+  id: string;
+  timestamp: string;
+  project_id: string;
+  actor_type: "human" | "doer" | "reviewer" | "system";
+  actor_id: string;
+  decision_type: DecisionType;
+  reason: string;
+  evidence_refs?: string[];
+  impact_summary: string;
+  metadata?: Record<string, unknown>;
+};
+
+export type CapacityState = {
+  maxConcurrentDoers: number;
+  maxReviewerRunsPerDraft: number;
+  reviewerRunsCurrentDraft: number;
+  queueDepth: number;
+};
+
 export type GlobalActivity = {
   title: string;
   detail?: string;
@@ -142,6 +195,9 @@ export type Project = DomainProject & {
   quick_actions?: QuickAction[];
   shadowReview?: ShadowReviewSnapshot;
   rolloutHistory?: RolloutHistoryEvent[];
+  decisionLog?: DecisionLogEvent[];
+  escalation?: EscalationState | null;
+  capacity?: CapacityState;
 };
 
 export type WorkspaceDefinition = {
@@ -245,6 +301,19 @@ type Store = {
   addHubEvent: (event: Omit<HubEvent, "id" | "timestamp"> & { id?: string; timestamp?: string }) => void;
   clearHubEvents: (projectId?: string) => void;
   updateProjectSetupDefaults: (updates: Partial<ProjectSetupDefaults>) => void;
+  appendDecisionLog: (
+    projectId: string,
+    event: Omit<DecisionLogEvent, "id" | "timestamp" | "project_id">
+  ) => void;
+  setProjectEscalation: (projectId: string, escalation: EscalationState | null) => void;
+  setProjectCapacity: (projectId: string, updates: Partial<CapacityState>) => void;
+};
+
+const defaultCapacityState: CapacityState = {
+  maxConcurrentDoers: 3,
+  maxReviewerRunsPerDraft: 5,
+  reviewerRunsCurrentDraft: 0,
+  queueDepth: 0,
 };
 
 export const useAppStore = create<Store>()(
@@ -307,6 +376,9 @@ export const useAppStore = create<Store>()(
           files: [],
           syncStatus: "idle",
           rolloutMode: "active",
+          decisionLog: [],
+          escalation: null,
+          capacity: { ...defaultCapacityState },
         };
 
         set((state) => ({
@@ -322,7 +394,15 @@ export const useAppStore = create<Store>()(
 
       createProject: (project) =>
         set((state) => ({
-          projects: [...state.projects, project],
+          projects: [
+            ...state.projects,
+            {
+              ...project,
+              decisionLog: project.decisionLog ?? [],
+              escalation: project.escalation ?? null,
+              capacity: project.capacity ?? { ...defaultCapacityState },
+            },
+          ],
           selectedProjectId: project.id,
         })),
 
@@ -428,6 +508,36 @@ export const useAppStore = create<Store>()(
       updateProjectSetupDefaults: (updates) =>
         set((state) => ({
           projectSetupDefaults: { ...state.projectSetupDefaults, ...updates },
+        })),
+      appendDecisionLog: (projectId, event) =>
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            const nextEvent: DecisionLogEvent = {
+              ...event,
+              id: `dlog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+              timestamp: new Date().toISOString(),
+              project_id: projectId,
+            };
+            return {
+              ...project,
+              decisionLog: [nextEvent, ...(project.decisionLog ?? [])].slice(0, 200),
+            };
+          }),
+        })),
+      setProjectEscalation: (projectId, escalation) =>
+        set((state) => ({
+          projects: state.projects.map((project) =>
+            project.id === projectId ? { ...project, escalation } : project
+          ),
+        })),
+      setProjectCapacity: (projectId, updates) =>
+        set((state) => ({
+          projects: state.projects.map((project) => {
+            if (project.id !== projectId) return project;
+            const previous = project.capacity ?? defaultCapacityState;
+            return { ...project, capacity: { ...previous, ...updates } };
+          }),
         })),
     }),
     {

@@ -125,4 +125,46 @@ describe("RightPanel rollout controls", () => {
     fireEvent.click(screen.getAllByRole("button", { name: /hide vera, the legal guard highlights/i })[0]);
     expect(onToggleJudgeVisibility).toHaveBeenCalledWith("legal_guard");
   });
+
+  it("renders ops rails with escalation, capacity, and latest decisions", () => {
+    render(
+      <RightPanel
+        syncStatus="done"
+        connector="local"
+        escalation={{
+          level: "L2",
+          trigger: "auto_fallback",
+          reason: "Candidate reviewer path failed quality threshold.",
+          recommended_action: "Stay on baseline and inspect conflict notes.",
+          status: "open",
+          created_at: "2026-02-08T08:00:00Z",
+        }}
+        capacity={{
+          maxConcurrentDoers: 3,
+          maxReviewerRunsPerDraft: 5,
+          reviewerRunsCurrentDraft: 4,
+          queueDepth: 1,
+        }}
+        decisionLog={[
+          {
+            id: "dlog-1",
+            timestamp: "2026-02-08T08:10:00Z",
+            project_id: "proj-1",
+            actor_type: "system",
+            actor_id: "rollout_guard",
+            decision_type: "fallback",
+            reason: "automatic fallback",
+            impact_summary: "Moved to shadow mode",
+          },
+        ]}
+      />
+    );
+
+    expect(screen.getByText(/ops rails/i)).toBeInTheDocument();
+    expect(screen.getByText(/l2 open/i)).toBeInTheDocument();
+    expect(screen.getByText(/reviewer budget/i)).toBeInTheDocument();
+    expect(screen.getByText("4/5")).toBeInTheDocument();
+    expect(screen.getByText(/latest decisions/i)).toBeInTheDocument();
+    expect(screen.getByText(/automatic fallback/i)).toBeInTheDocument();
+  });
 });
