@@ -340,13 +340,11 @@ export function RightPanel({
                           <button
                             type="button"
                             onClick={() => onRunSingleReview?.(reviewer.id)}
-                            className="inline-flex h-7 w-7 items-center justify-center rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
+                            className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
                             aria-label={`Run ${reviewer.name} review`}
                             title={`Run ${reviewer.name}`}
                           >
-                            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                              <polygon points="5,3 19,12 5,21 5,3" />
-                            </svg>
+                            Run
                           </button>
                           <button
                             type="button"
@@ -532,6 +530,9 @@ export function RightPanel({
                 {evidenceWarningCount} evidence/source warning{evidenceWarningCount === 1 ? "" : "s"} require review.
               </div>
             )}
+            <div className="mt-1 text-[10px] text-[var(--ash)]">
+              Tip: click a reviewer note to jump to the exact line in the editor.
+            </div>
           </div>
         )}
 
@@ -598,6 +599,9 @@ export function RightPanel({
             <p className="mb-2 text-[10px] text-[var(--ash)]">
               Concordia compares baseline and candidate reviewer paths, then automatically reverts to baseline when quality drops.
             </p>
+            <div className="mb-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5 text-[10px] text-[var(--smoke)]">
+              1) Run shadow review 2) Compare agreement/precision/recall 3) Promote or stay on baseline.
+            </div>
             {!shadowReview || shadowReview.status === "idle" ? (
               <p className="text-[10px] text-[var(--ash)]">
                 Compare baseline and candidate reviewer outputs silently.
@@ -706,6 +710,16 @@ export function RightPanel({
             <div className="text-[10px] text-[var(--zinc)]">
               Write a draft and run a review
             </div>
+            {onRunReview && (
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={onRunReview}
+                className="mt-3"
+              >
+                Run First Review
+              </Button>
+            )}
           </div>
         ) : (
           <div className="text-center py-6">
@@ -714,7 +728,7 @@ export function RightPanel({
               <span className="text-xs text-[var(--amber)]">Running reviewers...</span>
             </div>
             <div className="text-[10px] text-[var(--zinc)]">
-              This may take a few seconds
+              This may take a few seconds. Reviewers are checking facts, clarity, and risk.
             </div>
           </div>
         )}

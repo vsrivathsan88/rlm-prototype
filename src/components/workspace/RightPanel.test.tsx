@@ -122,7 +122,7 @@ describe("RightPanel rollout controls", () => {
     fireEvent.click(screen.getByRole("button", { name: /run vera, the legal guard review/i }));
     expect(onRunSingleReview).toHaveBeenCalledWith("legal_guard");
 
-    fireEvent.click(screen.getByRole("button", { name: /hide vera, the legal guard highlights/i }));
+    fireEvent.click(screen.getAllByRole("button", { name: /hide vera, the legal guard highlights/i })[0]);
     expect(onToggleJudgeVisibility).toHaveBeenCalledWith("legal_guard");
   });
 });

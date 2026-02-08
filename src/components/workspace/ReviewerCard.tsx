@@ -66,7 +66,10 @@ export function ReviewerCard({
   activeAnnotationId,
 }: ReviewerCardProps) {
   const [showReasoning, setShowReasoning] = useState(false);
+  const [showAllAnnotations, setShowAllAnnotations] = useState(false);
   const decision = decisionLabels[result.decision] ?? decisionLabels.pass;
+  const visibleAnnotations = showAllAnnotations ? result.annotations : result.annotations.slice(0, 3);
+  const hiddenAnnotationCount = Math.max(0, result.annotations.length - visibleAnnotations.length);
 
   return (
     <div
@@ -76,7 +79,7 @@ export function ReviewerCard({
         opacity: isVisible ? 1 : 0.55,
       }}
     >
-      {/* Header: color dot + name + controls */}
+      {/* Header: color dot + name + score */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2 min-w-0">
           <span
@@ -87,51 +90,34 @@ export function ReviewerCard({
             {result.judgeName}
           </span>
         </div>
+        <span className="text-xs font-mono font-semibold text-[var(--text-secondary)] ml-1">
+          {result.score.toFixed(1)}
+        </span>
+      </div>
 
-        {/* Controls: play + eye + score */}
-        <div className="flex items-center gap-1 flex-shrink-0">
-          {/* Play / re-run button */}
-          <button
-            onClick={onRun}
-            disabled={isRunning}
-            className="p-1 rounded hover:bg-[var(--interactive-hover)] transition-colors disabled:opacity-40"
-            title="Re-run this reviewer"
-          >
-            {isRunning ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="animate-spin">
-                <path d="M21 12a9 9 0 11-6.22-8.56" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <polygon points="5,3 19,12 5,21 5,3" />
-              </svg>
-            )}
-          </button>
-
-          {/* Eye toggle */}
-          <button
-            onClick={onToggleVisibility}
-            className="p-1 rounded hover:bg-[var(--interactive-hover)] transition-colors"
-            title={isVisible ? "Hide annotations" : "Show annotations"}
-          >
-            {isVisible ? (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
-                <circle cx="12" cy="12" r="3" />
-              </svg>
-            ) : (
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24" />
-                <line x1="1" y1="1" x2="23" y2="23" />
-              </svg>
-            )}
-          </button>
-
-          {/* Score */}
-          <span className="text-xs font-mono font-semibold text-[var(--text-secondary)] ml-1">
-            {result.score.toFixed(1)}
-          </span>
-        </div>
+      {/* Actions: clear labels for first-time users */}
+      <div className="mb-3 flex flex-wrap items-center gap-1.5">
+        <button
+          onClick={onRun}
+          disabled={isRunning}
+          className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)] px-2 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--phosphor)]/40 disabled:opacity-40"
+          aria-label={`Re-run ${result.judgeName}`}
+        >
+          {isRunning ? "Running..." : "Re-run"}
+        </button>
+        <button
+          onClick={onToggleVisibility}
+          className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)] px-2 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--phosphor)]/40"
+          aria-label={isVisible ? `Hide ${result.judgeName} highlights` : `Show ${result.judgeName} highlights`}
+        >
+          {isVisible ? "Highlights On" : "Highlights Off"}
+        </button>
+        <button
+          onClick={() => setShowReasoning(!showReasoning)}
+          className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)] px-2 text-[10px] text-[var(--text-secondary)] hover:text-[var(--text-primary)] hover:border-[var(--phosphor)]/40"
+        >
+          {showReasoning ? "Hide Summary" : "Show Summary"}
+        </button>
       </div>
 
       {/* Decision badge */}
@@ -144,7 +130,7 @@ export function ReviewerCard({
       {/* Annotations list */}
       {result.annotations.length > 0 && (
         <div className="space-y-1.5 mb-3">
-          {result.annotations.map((ann) => (
+          {visibleAnnotations.map((ann) => (
             <button
               key={ann.id}
               onClick={() => onAnnotationClick(ann.id)}
@@ -166,22 +152,21 @@ export function ReviewerCard({
               </span>
             </button>
           ))}
+          {hiddenAnnotationCount > 0 && (
+            <button
+              type="button"
+              onClick={() => setShowAllAnnotations(true)}
+              className="text-[10px] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)]"
+            >
+              Show {hiddenAnnotationCount} more issue{hiddenAnnotationCount === 1 ? "" : "s"}
+            </button>
+          )}
         </div>
       )}
 
       {result.annotations.length === 0 && (
-        <p className="text-xs text-[var(--text-tertiary)] mb-3">No issues found</p>
+        <p className="text-xs text-[var(--text-tertiary)] mb-3">No issues found in this pass.</p>
       )}
-
-      {/* Footer: reasoning toggle */}
-      <div className="flex items-center justify-end pt-2 border-t border-[var(--border-light)]">
-        <button
-          onClick={() => setShowReasoning(!showReasoning)}
-          className="text-[11px] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
-        >
-          {showReasoning ? "Hide summary" : "Show summary"}
-        </button>
-      </div>
 
       {/* Expandable reasoning summary */}
       {showReasoning && (
