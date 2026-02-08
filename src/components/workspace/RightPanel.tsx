@@ -44,12 +44,6 @@ interface RightPanelProps {
   crewReviewers?: Reviewer[];
 }
 
-const skills = [
-  { name: "Summarize sources", icon: "📑", shortcut: "⌘K" },
-  { name: "GTM Clarity Lens", icon: "🔍", shortcut: "⌘L" },
-  { name: "Launch readiness", icon: "🎯", shortcut: "⌘R" },
-];
-
 function formatRolloutTime(value?: string): string {
   if (!value) return "unknown time";
   const timestamp = Date.parse(value);
@@ -98,6 +92,51 @@ function summarizeCrewRole(
   return reviewer.reason || reviewer.description || "Reviews output quality";
 }
 
+function deriveSourceConfidence(reviewResults: ReviewResultFE[]): "High" | "Medium" | "Low" {
+  if (reviewResults.length === 0) return "Medium";
+  let criticalCount = 0;
+  for (const result of reviewResults) {
+    criticalCount += result.annotations.filter((annotation) => annotation.severity === "critical").length;
+  }
+  if (criticalCount >= 3) return "Low";
+  if (criticalCount >= 1) return "Medium";
+  return "High";
+}
+
+function countEvidenceWarnings(reviewResults: ReviewResultFE[]): number {
+  const pattern = /(unsupported|source|evidence|citation|unverified)/i;
+  let count = 0;
+  for (const result of reviewResults) {
+    for (const annotation of result.annotations) {
+      if (pattern.test(annotation.message)) count += 1;
+    }
+  }
+  return count;
+}
+
+function concordiaHealthLabel(shadowReview?: ShadowReviewSnapshot): {
+  label: string;
+  tone: "neutral" | "good" | "warn";
+} {
+  if (!shadowReview || shadowReview.status === "idle") {
+    return { label: "Not run yet", tone: "neutral" };
+  }
+  if (shadowReview.status === "running") {
+    return { label: "Comparing reviewer variants", tone: "neutral" };
+  }
+  if (shadowReview.status === "error") {
+    return { label: "Shadow run failed", tone: "warn" };
+  }
+  const agreement = shadowReview.decision_agreement_rate ?? 0;
+  const precision = shadowReview.precision_proxy ?? 0;
+  const recall = shadowReview.recall_proxy ?? 0;
+  const meanDelta = shadowReview.mean_score_delta ?? 0;
+  if (agreement >= 0.8 && precision >= 0.7 && recall >= 0.7 && meanDelta >= -0.15) {
+    return { label: "Healthy candidate reviewers", tone: "good" };
+  }
+  return { label: "Candidate reviewers need tuning", tone: "warn" };
+}
+
 export function RightPanel({
   syncStatus,
   connector,
@@ -131,7 +170,11 @@ export function RightPanel({
   const enabledDoers = crewDoers.filter((member) => member.enabled);
   const enabledCrewReviewers = crewReviewers.filter((member) => member.enabled);
   const [expandedCrewItem, setExpandedCrewItem] = useState<string | null>(null);
+  const [expandedReviewerCritiqueId, setExpandedReviewerCritiqueId] = useState<string | null>(null);
   const reviewerResultById = new Map(reviewResults.map((result) => [result.judgeId, result]));
+  const sourceConfidence = deriveSourceConfidence(reviewResults);
+  const evidenceWarningCount = countEvidenceWarnings(reviewResults);
+  const concordiaStatus = concordiaHealthLabel(shadowReview);
 
   return (
     <div className="w-72 flex-shrink-0 border-l border-[var(--glass-border)] bg-[var(--carbon)]/50 flex flex-col overflow-hidden">
@@ -276,6 +319,24 @@ export function RightPanel({
                           </span>
                         </button>
                         <div className="flex items-center gap-1">
+                          {reviewerResultById.get(reviewer.id) && (
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setExpandedReviewerCritiqueId((current) =>
+                                  current === reviewer.id ? null : reviewer.id
+                                );
+                                if (!visibleJudgeIds.has(reviewer.id)) {
+                                  onToggleJudgeVisibility?.(reviewer.id);
+                                }
+                              }}
+                              className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
+                              aria-label={`View ${reviewer.name} critique`}
+                              title="View critique"
+                            >
+                              Notes
+                            </button>
+                          )}
                           <button
                             type="button"
                             onClick={() => onRunSingleReview?.(reviewer.id)}
@@ -312,6 +373,31 @@ export function RightPanel({
                               </span>
                             )}
                           </div>
+                        </div>
+                      )}
+                      {expandedReviewerCritiqueId === reviewer.id && reviewerResultById.get(reviewer.id) && (
+                        <div className="mt-2 rounded border border-[var(--zinc)]/40 bg-[var(--carbon)] px-2 py-1.5">
+                          <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--ash)]">
+                            Latest Critique
+                          </div>
+                          {reviewerResultById.get(reviewer.id)?.annotations.length ? (
+                            <div className="space-y-1">
+                              {reviewerResultById.get(reviewer.id)?.annotations.slice(0, 3).map((annotation) => (
+                                <button
+                                  key={annotation.id}
+                                  type="button"
+                                  onClick={() => onAnnotationClick?.(annotation.id)}
+                                  className="w-full text-left text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
+                                >
+                                  - {annotation.message}
+                                </button>
+                              ))}
+                            </div>
+                          ) : (
+                            <p className="text-[10px] text-[var(--smoke)]">
+                              No issues flagged in the latest run.
+                            </p>
+                          )}
                         </div>
                       )}
                     </div>
@@ -416,6 +502,20 @@ export function RightPanel({
                 {reviewSummary.overallScore.toFixed(1)}/10
               </span>
             </div>
+            <div className="mb-1.5 flex items-center gap-2 text-[10px]">
+              <span className="text-[var(--ash)]">Source Confidence:</span>
+              <span
+                className={
+                  sourceConfidence === "High"
+                    ? "text-[var(--phosphor)]"
+                    : sourceConfidence === "Medium"
+                      ? "text-[var(--amber)]"
+                      : "text-[var(--coral)]"
+                }
+              >
+                {sourceConfidence}
+              </span>
+            </div>
             <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--ash)]">
               <span>{reviewSummary.totalIssues} issues</span>
               {reviewSummary.conflictsDetected > 0 && (
@@ -427,6 +527,11 @@ export function RightPanel({
                 </>
               )}
             </div>
+            {evidenceWarningCount > 0 && (
+              <div className="mt-1 text-[10px] text-[var(--amber)]">
+                {evidenceWarningCount} evidence/source warning{evidenceWarningCount === 1 ? "" : "s"} require review.
+              </div>
+            )}
           </div>
         )}
 
@@ -476,6 +581,23 @@ export function RightPanel({
                 {shadowReview?.status === "running" ? "Running..." : "Run Shadow Review"}
               </Button>
             </div>
+            <div className="mb-2 flex items-center gap-2 text-[10px]">
+              <span className="text-[var(--ash)]">Status:</span>
+              <span
+                className={
+                  concordiaStatus.tone === "good"
+                    ? "text-[var(--phosphor)]"
+                    : concordiaStatus.tone === "warn"
+                      ? "text-[var(--amber)]"
+                      : "text-[var(--smoke)]"
+                }
+              >
+                {concordiaStatus.label}
+              </span>
+            </div>
+            <p className="mb-2 text-[10px] text-[var(--ash)]">
+              Concordia compares baseline and candidate reviewer paths, then automatically reverts to baseline when quality drops.
+            </p>
             {!shadowReview || shadowReview.status === "idle" ? (
               <p className="text-[10px] text-[var(--ash)]">
                 Compare baseline and candidate reviewer outputs silently.
@@ -596,48 +718,6 @@ export function RightPanel({
             </div>
           </div>
         )}
-      </Panel>
-
-      {/* Skills */}
-      <Panel
-        className="border-0 flex-shrink-0"
-        header={
-          <PanelHeader
-            title="Skills"
-            icon={
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M12 2L2 7l10 5 10-5-10-5z" />
-                <path d="M2 17l10 5 10-5" />
-                <path d="M2 12l10 5 10-5" />
-              </svg>
-            }
-          />
-        }
-      >
-        <div className="space-y-2">
-          {skills.map((skill, i) => (
-            <button
-              key={skill.name}
-              className={`
-                w-full flex items-center justify-between px-3 py-2
-                bg-[var(--graphite)] border border-[var(--zinc)]
-                hover:border-[var(--phosphor)]/30 hover:bg-[var(--phosphor-glow)]
-                transition-all group
-                animate-fade-in-up stagger-${i + 1}
-              `}
-            >
-              <div className="flex items-center gap-2">
-                <span className="text-sm">{skill.icon}</span>
-                <span className="text-xs text-[var(--silver)] group-hover:text-[var(--pearl)]">
-                  {skill.name}
-                </span>
-              </div>
-              <span className="text-[10px] font-mono text-[var(--ash)] opacity-0 group-hover:opacity-100 transition-opacity">
-                {skill.shortcut}
-              </span>
-            </button>
-          ))}
-        </div>
       </Panel>
     </div>
   );

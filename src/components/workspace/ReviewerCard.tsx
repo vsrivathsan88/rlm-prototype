@@ -20,6 +20,12 @@ const decisionLabels: Record<string, { label: string; className: string }> = {
   fail: { label: "Fail", className: "badge-red" },
 };
 
+function summarizeReasoning(reasoning: string): string {
+  const normalized = reasoning.trim();
+  if (normalized.length <= 320) return normalized;
+  return `${normalized.slice(0, 320)}...`;
+}
+
 function SeverityIcon({ severity, color }: { severity: string; color: ReviewerColor }) {
   if (severity === "critical" || severity === "warning") {
     return (
@@ -173,15 +179,15 @@ export function ReviewerCard({
           onClick={() => setShowReasoning(!showReasoning)}
           className="text-[11px] text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
         >
-          {showReasoning ? "Hide reasoning" : "Show reasoning"}
+          {showReasoning ? "Hide summary" : "Show summary"}
         </button>
       </div>
 
-      {/* Expandable reasoning */}
+      {/* Expandable reasoning summary */}
       {showReasoning && (
         <div className="mt-3 pt-3 border-t border-[var(--border-light)]">
           <p className="text-xs text-[var(--text-secondary)] leading-relaxed">
-            {result.reasoning}
+            {summarizeReasoning(result.reasoning)}
           </p>
           {result.filesReferenced.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1">

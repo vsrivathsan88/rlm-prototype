@@ -37,6 +37,42 @@ type EditingCrewTarget =
   | { kind: "doer"; previousId: string; index: number }
   | { kind: "reviewer"; previousId: string; index: number };
 
+type SetupTimelineStep = {
+  id: "intent" | "crew" | "tools" | "ready";
+  label: string;
+  status: "pending" | "active" | "done";
+};
+
+const STARTER_KITS: Array<{
+  id: string;
+  name: string;
+  projectName: string;
+  goal: string;
+  context: string;
+}> = [
+  {
+    id: "launch_brief",
+    name: "Launch Brief",
+    projectName: "Q2 Launch Brief",
+    goal: "Create a launch brief with positioning, risks, timeline, and source-backed claims.",
+    context: "Audience: executive + cross-functional leads. Need concise, decision-ready output.",
+  },
+  {
+    id: "sales_proposal",
+    name: "Sales Proposal",
+    projectName: "Enterprise Proposal",
+    goal: "Draft an enterprise proposal with clear value, proof points, and objection handling.",
+    context: "Audience: buyer committee. Optimize for clarity, confidence, and next steps.",
+  },
+  {
+    id: "status_update",
+    name: "Weekly Update",
+    projectName: "Weekly Executive Update",
+    goal: "Generate a weekly status update with progress, blockers, dependencies, and asks.",
+    context: "Audience: leadership. Keep it short, factual, and action-oriented.",
+  },
+];
+
 function mapAgentTools(raw: unknown): Array<{
   tool_name: string;
   tool_description: string;
@@ -175,6 +211,15 @@ function buildPersonalizedDoers(profile: UserProfile | null, goal: string): Doer
   return base;
 }
 
+function titleize(text: string): string {
+  return text
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6)
+    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
 function defaultReviewers(profile: UserProfile | null): Reviewer[] {
   const role = (profile?.job_function || "").toLowerCase();
   const shared: Reviewer[] = [
@@ -265,7 +310,9 @@ export default function NewProject() {
     projectSetupDefaults.crewMeta ?? null
   );
   const [setupMode, setSetupMode] = useState<"simple" | "pro">("simple");
+  const [quickIntent, setQuickIntent] = useState("");
   const [setupContext, setSetupContext] = useState("");
+  const [setupTimeline, setSetupTimeline] = useState<SetupTimelineStep[]>([]);
   const [editingCrew, setEditingCrew] = useState<EditingCrewTarget | null>(null);
 
   // Google Drive folder browser state
@@ -294,6 +341,7 @@ export default function NewProject() {
     []
   );
   const userProfile = onboarding.user_profile || null;
+  const onboardingFirstProjectGoal = onboarding.workspace?.first_project?.goal;
   const isGDrive = connector === "gdrive";
   const isLocal = connector === "local";
   const activeDoersCount = doers.filter((d) => d.enabled).length;
@@ -301,10 +349,10 @@ export default function NewProject() {
   const activeToolsCount =
     doers.reduce((count, doer) => count + (doer.tools?.length || 0), 0) +
     reviewers.reduce((count, reviewer) => count + (reviewer.tools?.length || 0), 0);
+  const connectorRequirementsMet = connector !== "local" || localFolderFiles.length > 0;
   const canCreate =
     name.trim().length > 0 &&
-    !!connector &&
-    (!isLocal || localFolderFiles.length > 0) &&
+    connectorRequirementsMet &&
     activeDoersCount > 0 &&
     activeReviewersCount > 0;
 
@@ -322,14 +370,14 @@ export default function NewProject() {
   }, [goal, name, onboarding.workspace]);
 
   useEffect(() => {
-    if (goal.trim().length > 0 || !onboarding.user_profile || onboarding.workspace?.first_project?.goal) return;
+    if (goal.trim().length > 0 || !onboarding.user_profile || onboardingFirstProjectGoal) return;
 
     const role = onboarding.user_profile.job_function?.replaceAll("_", " ");
     const audience = onboarding.user_profile.industry;
     const roleLabel = role ? role.charAt(0).toUpperCase() + role.slice(1) : "the team";
     const audienceLabel = audience ? ` in ${audience.toUpperCase()}` : "";
     setGoal(`Create a high-confidence project brief for ${roleLabel}${audienceLabel}.`);
-  }, [goal, onboarding.user_profile]);
+  }, [goal, onboarding.user_profile, onboardingFirstProjectGoal]);
 
   useEffect(() => {
     if (doers.length > 0) return;
@@ -395,8 +443,21 @@ export default function NewProject() {
     [doers, editingCrew, reviewers]
   );
 
-  const create = async () => {
-    if (!canCreate) return;
+  const create = useCallback(async (overrides?: {
+    name?: string;
+    goal?: string;
+    doers?: Doer[];
+    reviewers?: Reviewer[];
+  }) => {
+    const finalName = (overrides?.name ?? name).trim();
+    const finalGoal = (overrides?.goal ?? goal).trim();
+    const finalDoers = overrides?.doers ?? doers;
+    const finalReviewers = overrides?.reviewers ?? reviewers;
+
+    const finalActiveDoers = finalDoers.filter((d) => d.enabled).length;
+    const finalActiveReviewers = finalReviewers.filter((r) => r.enabled).length;
+    const requirementsMet = connector !== "local" || localFolderFiles.length > 0;
+    if (!finalName || !requirementsMet || finalActiveDoers === 0 || finalActiveReviewers === 0) return;
 
     const projectId = `proj-${Date.now()}`;
     updateProjectSetupDefaults({
@@ -404,8 +465,8 @@ export default function NewProject() {
       localSourcePath: "",
       gdriveFolderId: isGDrive ? (selectedFolder?.id ?? null) : null,
       gdriveFolderName: isGDrive ? (selectedFolder?.name ?? null) : null,
-      crewDoers: doers,
-      crewReviewers: reviewers,
+      crewDoers: finalDoers,
+      crewReviewers: finalReviewers,
       crewMeta,
     });
 
@@ -459,20 +520,20 @@ export default function NewProject() {
 
         createProject({
           id: projectId,
-          name: name.trim(),
+          name: finalName,
           connector: null,
           connectorConfig: {},
-          goal: goal.trim() || null,
+          goal: finalGoal || null,
           syncStatus: "done",
           files: filesBody.files || [],
-          doers,
-          reviewers,
+          doers: finalDoers,
+          reviewers: finalReviewers,
           rolloutMode: "active",
         });
         try {
           await persistCrewVersion(projectId, {
-            doers,
-            reviewers,
+            doers: finalDoers,
+            reviewers: finalReviewers,
             reason: "Initial crew from project setup",
             source: "manual",
             meta: crewMeta ?? undefined,
@@ -503,22 +564,22 @@ export default function NewProject() {
 
     createProject({
       id: projectId,
-      name: name.trim(),
+      name: finalName,
       connector,
       connectorConfig: isGDrive
         ? (selectedFolder?.id ? { folder_id: selectedFolder.id } : {})
         : {},
-      goal: goal.trim() || null,
+      goal: finalGoal || null,
       syncStatus: connector ? "syncing" : "idle",
       files: [],
-      doers,
-      reviewers,
+      doers: finalDoers,
+      reviewers: finalReviewers,
       rolloutMode: "active",
     });
     try {
       await persistCrewVersion(projectId, {
-        doers,
-        reviewers,
+        doers: finalDoers,
+        reviewers: finalReviewers,
         reason: "Initial crew from project setup",
         source: "manual",
         meta: crewMeta ?? undefined,
@@ -530,7 +591,23 @@ export default function NewProject() {
       );
     }
     router.push("/");
-  };
+  }, [
+    backendUrl,
+    connector,
+    createProject,
+    crewMeta,
+    doers,
+    goal,
+    isGDrive,
+    isLocal,
+    localFolderFiles,
+    name,
+    reviewers,
+    router,
+    selectedFolder,
+    setGlobalActivity,
+    updateProjectSetupDefaults,
+  ]);
 
   const loadDriveChildren = useCallback(
     async (parentId: string | null) => {
@@ -586,29 +663,50 @@ export default function NewProject() {
     [backendUrl]
   );
 
-  const generatePersonalizedCrew = useCallback(async () => {
-    if (!goal.trim()) {
+  const generatePersonalizedCrew = useCallback(async (overrides?: {
+    name?: string;
+    goal?: string;
+    context?: string;
+  }) => {
+    const effectiveGoal = (overrides?.goal ?? goal).trim();
+    const effectiveName = ((overrides?.name ?? name) || "Untitled Project").trim();
+    if (!effectiveGoal) {
       notify.warning("Add a Goal First", "Set a project goal so crew prompts can be specific.");
-      return;
+      return null;
     }
 
+    setSetupTimeline([
+      { id: "intent", label: "Interpreting your goal", status: "active" },
+      { id: "crew", label: "Designing doers and reviewers", status: "pending" },
+      { id: "tools", label: "Attaching starter tools", status: "pending" },
+      { id: "ready", label: "Ready to launch project", status: "pending" },
+    ]);
     setCrewLoading(true);
     try {
       const currentWorkPayload =
         userProfile?.current_work && typeof userProfile.current_work === "object"
           ? { ...userProfile.current_work }
           : {};
-      const setupContextText = setupContext.trim();
+      const setupContextText = (overrides?.context ?? setupContext).trim();
       if (setupContextText) {
         currentWorkPayload.setup_context = setupContextText;
       }
+      setSetupTimeline((prev) =>
+        prev.map((step) =>
+          step.id === "intent"
+            ? { ...step, status: "done" }
+            : step.id === "crew"
+              ? { ...step, status: "active" }
+              : step
+        )
+      );
 
       const response = await fetch(`${backendUrl}/v1/projects/generate-crew`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          project_name: name || "Untitled Project",
-          project_goal: goal,
+          project_name: effectiveName,
+          project_goal: effectiveGoal,
           target_audience: "",
           job_function: userProfile?.job_function,
           team_size: userProfile?.team_size,
@@ -629,23 +727,89 @@ export default function NewProject() {
       );
       setCrewMeta(body._meta && typeof body._meta === "object" ? body._meta : null);
 
-      setDoers(nextDoers.length ? nextDoers : buildPersonalizedDoers(userProfile, goal));
-      setReviewers(nextReviewers.length ? nextReviewers : defaultReviewers(userProfile));
+      const resolvedDoers = nextDoers.length ? nextDoers : buildPersonalizedDoers(userProfile, effectiveGoal);
+      const resolvedReviewers = nextReviewers.length ? nextReviewers : defaultReviewers(userProfile);
+      setDoers(resolvedDoers);
+      setReviewers(resolvedReviewers);
       setCrewGenerated(true);
-      notify.success("Crew Updated", "Doers and reviewers now include detailed prompts and rubrics.");
+      setSetupTimeline((prev) =>
+        prev.map((step) =>
+          step.id === "crew"
+            ? { ...step, status: "done" }
+            : step.id === "tools"
+              ? { ...step, status: "done" }
+              : step.id === "ready"
+                ? { ...step, status: "active" }
+                : step
+        )
+      );
+      notify.success("Crew Updated", "Doers, reviewers, and starter tools are ready.");
+      setSetupTimeline((prev) =>
+        prev.map((step) =>
+          step.id === "ready"
+            ? { ...step, status: "done" }
+            : step
+        )
+      );
+      return { doers: resolvedDoers, reviewers: resolvedReviewers };
     } catch (error) {
       notify.error(
         "Could Not Personalize Crew",
         error instanceof Error ? error.message : "Using default doers/reviewers."
       );
-      setDoers(buildPersonalizedDoers(userProfile, goal));
-      setReviewers(defaultReviewers(userProfile));
+      const fallbackDoers = buildPersonalizedDoers(userProfile, effectiveGoal);
+      const fallbackReviewers = defaultReviewers(userProfile);
+      setDoers(fallbackDoers);
+      setReviewers(fallbackReviewers);
       setCrewMeta(null);
       setCrewGenerated(false);
+      setSetupTimeline([]);
+      return { doers: fallbackDoers, reviewers: fallbackReviewers };
     } finally {
       setCrewLoading(false);
     }
   }, [backendUrl, goal, name, setupContext, userProfile]);
+
+  const runDoItForMe = useCallback(async () => {
+    const intent = quickIntent.trim();
+    if (!intent) {
+      notify.warning("Add a Goal", "Tell us what you want done this week.");
+      return;
+    }
+    const intentName = name.trim() ? name.trim() : titleize(intent);
+    if (!name.trim()) setName(intentName);
+    setGoal(intent);
+    if (!connector) {
+      setConnector("gdrive");
+      updateProjectSetupDefaults({ connector: "gdrive" });
+    }
+    if (connector === "local" && localFolderFiles.length === 0) {
+      setConnector("gdrive");
+      updateProjectSetupDefaults({ connector: "gdrive" });
+      notify.info("Switched to Google Drive", "Simple setup works fastest with cloud sync by default.");
+    }
+    const generated = await generatePersonalizedCrew({
+      name: intentName,
+      goal: intent,
+      context: setupContext.trim() || `Operator intent: ${intent}`,
+    });
+    if (!generated) return;
+    await create({
+      name: intentName,
+      goal: intent,
+      doers: generated.doers,
+      reviewers: generated.reviewers,
+    });
+  }, [
+    connector,
+    create,
+    generatePersonalizedCrew,
+    name,
+    quickIntent,
+    setupContext,
+    updateProjectSetupDefaults,
+    localFolderFiles.length,
+  ]);
 
   useEffect(() => {
     if (hasAutoGeneratedCrewRef.current) return;
@@ -1102,6 +1266,93 @@ export default function NewProject() {
               "
             />
           </Panel>
+
+          {setupMode === "simple" && (
+            <Panel
+              className="animate-fade-in-up"
+              header={
+                <PanelHeader
+                  title="Do It For Me"
+                  icon={
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                      <path d="M12 2l3.09 6.26L22 9.27l-5 4.87L18.18 22 12 18.77 5.82 22 7 14.14l-5-4.87 6.91-1.01L12 2z" />
+                    </svg>
+                  }
+                />
+              }
+            >
+              <div className="space-y-3">
+                <p className="text-xs text-[var(--smoke)]">
+                  Describe what you need this week. We will auto-create project, team, and starter tools.
+                </p>
+                <textarea
+                  value={quickIntent}
+                  onChange={(e) => setQuickIntent(e.target.value)}
+                  rows={2}
+                  placeholder="e.g., Build an executive-ready launch brief with risks and next actions."
+                  className="
+                    w-full px-4 py-3
+                    bg-[var(--graphite)] border border-[var(--zinc)]
+                    text-[var(--pearl)] text-sm
+                    placeholder:text-[var(--ash)]
+                    resize-none
+                    focus:outline-none focus:border-[var(--phosphor)]/50 focus:ring-1 focus:ring-[var(--phosphor)]/20
+                    transition-all
+                  "
+                />
+                <div className="flex flex-wrap gap-2">
+                  {STARTER_KITS.map((kit) => (
+                    <button
+                      key={kit.id}
+                      type="button"
+                      onClick={() => {
+                        setQuickIntent(kit.goal);
+                        setName(kit.projectName);
+                        setGoal(kit.goal);
+                        setSetupContext(kit.context);
+                      }}
+                      className="rounded border border-[var(--zinc)] bg-[var(--graphite)] px-2.5 py-1.5 text-xs text-[var(--smoke)] hover:border-[var(--phosphor)]/30 hover:text-[var(--pearl)]"
+                    >
+                      {kit.name}
+                    </button>
+                  ))}
+                </div>
+                <Button
+                  variant="primary"
+                  onClick={runDoItForMe}
+                  isLoading={crewLoading || localUploading}
+                  disabled={crewLoading || localUploading}
+                >
+                  Do It For Me
+                </Button>
+                {setupTimeline.length > 0 && (
+                  <div className="rounded border border-[var(--zinc)] bg-[var(--graphite)] px-3 py-2">
+                    <div className="mb-1 text-[10px] font-mono uppercase tracking-[0.12em] text-[var(--ash)]">
+                      AI Setup Timeline · ~20s
+                    </div>
+                    <div className="space-y-1">
+                      {setupTimeline.map((step) => (
+                        <div key={step.id} className="flex items-center gap-2 text-xs">
+                          <span
+                            className={`inline-block h-2 w-2 rounded-full ${
+                              step.status === "done"
+                                ? "bg-[var(--phosphor)]"
+                                : step.status === "active"
+                                  ? "bg-[var(--amber)] animate-pulse"
+                                  : "bg-[var(--zinc)]"
+                            }`}
+                          />
+                          <span className={step.status === "pending" ? "text-[var(--ash)]" : "text-[var(--smoke)]"}>
+                            {step.label}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+            </Panel>
+          )}
 
           <Panel
             className="animate-fade-in-up"

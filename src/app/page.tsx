@@ -353,6 +353,40 @@ export default function Home() {
       })
       .filter((value): value is string => Boolean(value))
       .join("\n\n");
+    const reviewerSystemPrompt = mentionedReviewers
+      .map((reviewer) => {
+        const source = (selectedProject.reviewers || []).find((item) => item.id === reviewer.id);
+        const tools = source?.tools || [];
+        const toolsBlock =
+          tools.length > 0
+            ? `\n\nAvailable tools:\n${tools
+                .map(
+                  (tool, index) =>
+                    `${index + 1}. ${tool.tool_name}: ${tool.tool_description} -> ${tool.tool_output}`
+                )
+                .join("\n")}`
+            : "";
+        if (!source?.system_prompt) {
+          return `Reviewer: ${reviewer.name}${toolsBlock}`;
+        }
+        return `Reviewer: ${reviewer.name}\n${source.system_prompt}${toolsBlock}`;
+      })
+      .filter((value): value is string => Boolean(value))
+      .join("\n\n");
+    const combinedSystemPrompt = [doerSystemPrompt, reviewerSystemPrompt]
+      .filter((value) => value && value.trim().length > 0)
+      .join("\n\n");
+
+    const externalActionPattern = /\b(send|email|post|publish|export|share|notify)\b/i;
+    if (externalActionPattern.test(cleanPrompt) && typeof window !== "undefined") {
+      const confirmed = window.confirm(
+        "This request may trigger an external action. Continue?"
+      );
+      if (!confirmed) {
+        notify.info("Action Cancelled", "External action requires explicit confirmation.");
+        return;
+      }
+    }
 
     const targetNames = [...mentionedDoers.map((d) => d.name), ...mentionedReviewers.map((r) => r.name)];
     if (targetNames.length) {
@@ -364,7 +398,7 @@ export default function Home() {
 
     const escapedPrompt = JSON.stringify(cleanPrompt);
     const escapedModel = JSON.stringify(model || "auto");
-    const escapedSystemPrompt = doerSystemPrompt ? JSON.stringify(doerSystemPrompt) : null;
+    const escapedSystemPrompt = combinedSystemPrompt ? JSON.stringify(combinedSystemPrompt) : null;
     const code = escapedSystemPrompt
       ? `print(ask_llm(${escapedPrompt}, model=${escapedModel}, system_prompt=${escapedSystemPrompt}))`
       : `print(ask_llm(${escapedPrompt}, model=${escapedModel}))`;

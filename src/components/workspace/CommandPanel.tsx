@@ -33,6 +33,14 @@ const models = [
   { id: "openai/gpt-oss-120b", name: "GPT-OSS 120B", description: "Heavy Reasoning" },
 ];
 
+const qualityPresets = [
+  { id: "good", label: "Good", instruction: "Keep this concise and useful." },
+  { id: "better", label: "Better", instruction: "Include clear steps, assumptions, and risks." },
+  { id: "best", label: "Best", instruction: "Be thorough, source-aware, and decision-ready with tradeoffs." },
+] as const;
+
+type QualityPreset = (typeof qualityPresets)[number]["id"];
+
 const FALLBACK_OTHER_BLOCK: PromptEnhancerUIBlock = {
   id: "other_context",
   label: "Other Context",
@@ -84,6 +92,8 @@ export function CommandPanel({
   const [enhancerValues, setEnhancerValues] = useState<Record<string, unknown>>({});
   const [enhancerMode, setEnhancerMode] = useState<"assist" | "auto">("assist");
   const [enhancerRewritePlan, setEnhancerRewritePlan] = useState<PromptEnhancerRewritePlan | undefined>(undefined);
+  const [qualityPreset, setQualityPreset] = useState<QualityPreset>("better");
+  const [autoCoachEnabled, setAutoCoachEnabled] = useState(true);
   const isInline = mode === "inline";
 
   // Generate personalized suggestions based on project context
@@ -167,9 +177,23 @@ export function CommandPanel({
 
   if (!isInline && !isOpen) return null;
 
+  const applyPromptCoach = (value: string): string => {
+    let next = value.trim();
+    const qualityInstruction =
+      qualityPresets.find((preset) => preset.id === qualityPreset)?.instruction ??
+      qualityPresets[1].instruction;
+    next = `${next}\n\nOutput Quality Target: ${qualityInstruction}`;
+
+    if (autoCoachEnabled && next.length < 240) {
+      next = `${next}\n\nStructure your response as: Objective, Plan, Assumptions, Risks, and Next Actions.`;
+    }
+    return next;
+  };
+
   const handleRun = () => {
     if (prompt.trim()) {
-      onRun(prompt.trim(), selectedModel);
+      const coached = applyPromptCoach(prompt);
+      onRun(coached, selectedModel);
       setPrompt("");
     }
   };
@@ -293,6 +317,45 @@ export function CommandPanel({
     }
   };
 
+  const handleQuickReviewerAction = (mode: "facts" | "clarity" | "exec") => {
+    if (isRunning) return;
+    const fallbackReviewer = reviewers.find((reviewer) => reviewer.enabled);
+    const factReviewer =
+      reviewers.find(
+        (reviewer) =>
+          reviewer.enabled &&
+          /(fact|integrity|evidence|source)/i.test(`${reviewer.id} ${reviewer.name} ${reviewer.reason}`)
+      ) || fallbackReviewer;
+    const clarityReviewer =
+      reviewers.find(
+        (reviewer) =>
+          reviewer.enabled &&
+          /(clarity|structure|readability|tone)/i.test(`${reviewer.id} ${reviewer.name} ${reviewer.reason}`)
+      ) || fallbackReviewer;
+    const execReviewer =
+      reviewers.find(
+        (reviewer) =>
+          reviewer.enabled &&
+          /(executive|risk|decision|strategy)/i.test(`${reviewer.id} ${reviewer.name} ${reviewer.reason}`)
+      ) || fallbackReviewer;
+
+    const target =
+      mode === "facts" ? factReviewer : mode === "clarity" ? clarityReviewer : execReviewer;
+    if (!target) {
+      notify.warning("No Reviewer Available", "Enable at least one reviewer to run quick checks.");
+      return;
+    }
+
+    const baseInstruction =
+      mode === "facts"
+        ? "Check this draft for unsupported claims and missing evidence."
+        : mode === "clarity"
+          ? "Rewrite this draft for clarity, flow, and readability."
+          : "Make this draft executive-ready with key decisions and risks.";
+    const quickPrompt = `@${target.id} ${baseInstruction}`;
+    onRun(applyPromptCoach(quickPrompt), selectedModel);
+  };
+
   const panelContent = (
     <Panel
       header={
@@ -370,6 +433,60 @@ export function CommandPanel({
           <div className="absolute bottom-3 right-3 flex items-center gap-2 text-[10px] text-[var(--ash)]">
             <KeyboardShortcut keys={["⌘", "↵"]} />
             <span>to run</span>
+          </div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
+              Quality
+            </span>
+            <div className="flex gap-1">
+              {qualityPresets.map((preset) => (
+                <button
+                  key={preset.id}
+                  onClick={() => setQualityPreset(preset.id)}
+                  className={`px-2 py-1 text-[10px] border ${
+                    qualityPreset === preset.id
+                      ? "border-[var(--phosphor)]/40 text-[var(--phosphor)] bg-[var(--phosphor-glow)]"
+                      : "border-[var(--zinc)] text-[var(--smoke)] bg-[var(--graphite)] hover:text-[var(--pearl)]"
+                  }`}
+                >
+                  {preset.label}
+                </button>
+              ))}
+            </div>
+            <label className="ml-auto inline-flex items-center gap-1 text-[10px] text-[var(--ash)]">
+              <input
+                type="checkbox"
+                checked={autoCoachEnabled}
+                onChange={(e) => setAutoCoachEnabled(e.target.checked)}
+              />
+              Prompt Coach
+            </label>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              onClick={() => handleQuickReviewerAction("facts")}
+              className="px-2 py-1 text-[10px] border border-[var(--zinc)] bg-[var(--graphite)] text-[var(--smoke)] hover:text-[var(--pearl)]"
+            >
+              Check Facts
+            </button>
+            <button
+              type="button"
+              onClick={() => handleQuickReviewerAction("clarity")}
+              className="px-2 py-1 text-[10px] border border-[var(--zinc)] bg-[var(--graphite)] text-[var(--smoke)] hover:text-[var(--pearl)]"
+            >
+              Make Clearer
+            </button>
+            <button
+              type="button"
+              onClick={() => handleQuickReviewerAction("exec")}
+              className="px-2 py-1 text-[10px] border border-[var(--zinc)] bg-[var(--graphite)] text-[var(--smoke)] hover:text-[var(--pearl)]"
+            >
+              Exec-Ready
+            </button>
           </div>
         </div>
 
