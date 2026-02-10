@@ -1,88 +1,19 @@
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { RightPanel } from "./RightPanel";
-import type { RolloutHistoryEvent } from "@/lib/store";
+import type { CommentThread } from "@/lib/store";
 
-const historyWithFallback: RolloutHistoryEvent[] = [
-  {
-    mode: "active",
-    from_mode: "shadow",
-    updated_at: "2026-02-07T09:00:00Z",
-    reason: "manual promote",
-    source: "manual",
-  },
-  {
-    mode: "shadow",
-    from_mode: "active",
-    updated_at: "2026-02-07T10:00:00Z",
-    reason: "auto fallback",
-    source: "auto_fallback",
-    trigger: "candidate failure",
-  },
-];
-
-describe("RightPanel rollout controls", () => {
-  it("opens history and triggers recover action after fallback", () => {
-    const onOpenRolloutHistory = vi.fn();
-    const onRecoverToActive = vi.fn();
-
+describe("RightPanel behavior", () => {
+  it("hides legacy shadow rollout controls", () => {
     render(
       <RightPanel
         syncStatus="done"
         connector="local"
-        onRunShadowReview={() => {}}
-        rolloutMode="shadow"
-        rolloutHistory={historyWithFallback}
-        onOpenRolloutHistory={onOpenRolloutHistory}
-        onRecoverToActive={onRecoverToActive}
       />
     );
 
-    fireEvent.click(screen.getByRole("button", { name: /view full history/i }));
-    expect(onOpenRolloutHistory).toHaveBeenCalledTimes(1);
-
-    fireEvent.click(screen.getByRole("button", { name: /recover to active/i }));
-    expect(onRecoverToActive).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides recover action when mode is already active", () => {
-    render(
-      <RightPanel
-        syncStatus="done"
-        connector="local"
-        onRunShadowReview={() => {}}
-        rolloutMode="active"
-        rolloutHistory={historyWithFallback}
-        onOpenRolloutHistory={() => {}}
-        onRecoverToActive={() => {}}
-      />
-    );
-
-    expect(screen.queryByRole("button", { name: /recover to active/i })).not.toBeInTheDocument();
-  });
-
-  it("hides recover action when no fallback event exists", () => {
-    render(
-      <RightPanel
-        syncStatus="done"
-        connector="local"
-        onRunShadowReview={() => {}}
-        rolloutMode="shadow"
-        rolloutHistory={[
-          {
-            mode: "shadow",
-            from_mode: "baseline",
-            updated_at: "2026-02-07T08:00:00Z",
-            reason: "manual set",
-            source: "manual",
-          },
-        ]}
-        onOpenRolloutHistory={() => {}}
-        onRecoverToActive={() => {}}
-      />
-    );
-
-    expect(screen.queryByRole("button", { name: /recover to active/i })).not.toBeInTheDocument();
+    expect(screen.queryByText(/shadow concordia/i)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /run shadow review/i })).not.toBeInTheDocument();
   });
 
   it("exposes run and hide/show controls on compact reviewer rows", () => {
@@ -126,45 +57,109 @@ describe("RightPanel rollout controls", () => {
     expect(onToggleJudgeVisibility).toHaveBeenCalledWith("legal_guard");
   });
 
-  it("renders ops rails with escalation, capacity, and latest decisions", () => {
+  it("shows thread controls and routes actions", () => {
+    const onSelectThread = vi.fn();
+    const onAcceptThreadSuggestion = vi.fn();
+    const onRejectThreadSuggestion = vi.fn();
+    const onResolveThread = vi.fn();
+
+    const threads: CommentThread[] = [
+      {
+        id: "thread-1",
+        key: "p1:legal_guard:legal_guard-0",
+        project_id: "p1",
+        annotation_id: "legal_guard-0",
+        judge_id: "legal_guard",
+        judge_name: "Vera, the Legal Guard",
+        severity: "warning",
+        status: "open",
+        anchor: { startPos: 1, endPos: 20, startLine: 2, endLine: 2 },
+        color: { id: "blue", underline: "#2563eb", bg: "rgba(37,99,235,.08)", label: "Blue" },
+        messages: [
+          {
+            id: "m-1",
+            author_type: "reviewer",
+            author_name: "Vera, the Legal Guard",
+            body: "Replace this sentence with \"Clear legal disclaimer.\"",
+            created_at: "2026-02-08T09:30:00Z",
+          },
+        ],
+        suggestion: {
+          id: "s-1",
+          kind: "replace_range",
+          status: "pending",
+          from: 1,
+          to: 20,
+          original_text: "Old text",
+          replacement_text: "Clear legal disclaimer.",
+        },
+        created_at: "2026-02-08T09:30:00Z",
+        updated_at: "2026-02-08T09:30:00Z",
+      },
+    ];
+
     render(
       <RightPanel
         syncStatus="done"
         connector="local"
-        escalation={{
-          level: "L2",
-          trigger: "auto_fallback",
-          reason: "Candidate reviewer path failed quality threshold.",
-          recommended_action: "Stay on baseline and inspect conflict notes.",
-          status: "open",
-          created_at: "2026-02-08T08:00:00Z",
-        }}
-        capacity={{
-          maxConcurrentDoers: 3,
-          maxReviewerRunsPerDraft: 5,
-          reviewerRunsCurrentDraft: 4,
-          queueDepth: 1,
-        }}
-        decisionLog={[
-          {
-            id: "dlog-1",
-            timestamp: "2026-02-08T08:10:00Z",
-            project_id: "proj-1",
-            actor_type: "system",
-            actor_id: "rollout_guard",
-            decision_type: "fallback",
-            reason: "automatic fallback",
-            impact_summary: "Moved to shadow mode",
-          },
-        ]}
+        commentThreads={threads}
+        activeThreadId="thread-1"
+        onSelectThread={onSelectThread}
+        onAcceptThreadSuggestion={onAcceptThreadSuggestion}
+        onRejectThreadSuggestion={onRejectThreadSuggestion}
+        onResolveThread={onResolveThread}
       />
     );
 
-    expect(screen.getByText(/ops rails/i)).toBeInTheDocument();
-    expect(screen.getByText(/l2 open/i)).toBeInTheDocument();
-    expect(screen.getByText(/reviewer budget/i)).toBeInTheDocument();
-    expect(screen.getByText("4/5")).toBeInTheDocument();
-    expect(screen.getByText(/latest decisions/i)).toBeInTheDocument();
-    expect(screen.getByText(/automatic fallback/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /vera, the legal guard/i }));
+    expect(onSelectThread).toHaveBeenCalledWith("thread-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Accept" }));
+    expect(onAcceptThreadSuggestion).toHaveBeenCalledWith("thread-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+    expect(onRejectThreadSuggestion).toHaveBeenCalledWith("thread-1");
+
+    fireEvent.click(screen.getByRole("button", { name: "Resolve" }));
+    expect(onResolveThread).toHaveBeenCalledWith("thread-1");
+  });
+
+  it("shows last run trace with docs read and citations", () => {
+    render(
+      <RightPanel
+        syncStatus="done"
+        connector="local"
+        lastCommandTrace={{
+          created_at: "2026-02-08T11:45:00Z",
+          model: "qwen/qwen3-32b",
+          provider: "groq",
+          answer_preview: "Draft complete with prioritized action items.",
+          reasoning: "Reasoned about launch clarity and execution risk.",
+          reasoning_summary: "Used launch brief and FAQ evidence.",
+          context_files: ["brief.md", "faq.docx"],
+          context_file_count: 2,
+          context_file_summaries: [
+            { filename: "brief.md", chars: 320, preview: "Launch timeline and risks" },
+            { filename: "faq.docx", chars: 210, preview: "Pricing answers and objections" },
+          ],
+          citations: [
+            {
+              filename: "brief.md",
+              quote: "Launch starts on March 14",
+              why: "Supports timing claim",
+              line_start: 12,
+              line_end: 12,
+            },
+          ],
+          evidence_gaps: ["No source confirms budget assumptions."],
+        }}
+      />
+    );
+
+    expect(screen.getByText(/last run/i)).toBeInTheDocument();
+    expect(screen.getByText(/docs read: 2/i)).toBeInTheDocument();
+    expect(screen.getByText(/citations: 1/i)).toBeInTheDocument();
+    expect(screen.getByText(/launch starts on march 14/i)).toBeInTheDocument();
+    expect(screen.getByText(/gap: no source confirms budget assumptions\./i)).toBeInTheDocument();
   });
 });

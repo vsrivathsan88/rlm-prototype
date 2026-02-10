@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef } from "react";
 import { useEditor, EditorContent, type Editor as TiptapEditor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
@@ -11,14 +11,20 @@ import {
   ReviewAnnotationsExtension,
   type AnnotationWithColor,
 } from "@/lib/extensions/review-annotations";
+import { CommentThreadsExtension } from "@/lib/extensions/comment-threads";
+import type { CommentThread } from "@/lib/store";
 
 interface EditorProps {
   onCmdK: () => void;
   disabled?: boolean;
   annotations?: AnnotationWithColor[];
+  commentThreads?: CommentThread[];
   activeAnnotationId?: string | null;
+  activeThreadId?: string | null;
   onAnnotationClick?: (annotationId: string) => void;
   onAnnotationHover?: (annotationId: string | null, rect?: DOMRect) => void;
+  onThreadClick?: (threadId: string, rect?: DOMRect) => void;
+  onThreadHover?: (threadId: string | null, rect?: DOMRect) => void;
   editorRef?: (editor: TiptapEditor | null) => void;
 }
 
@@ -26,21 +32,43 @@ export function Editor({
   onCmdK,
   disabled,
   annotations = [],
+  commentThreads = [],
   activeAnnotationId = null,
+  activeThreadId = null,
   onAnnotationClick,
   onAnnotationHover,
+  onThreadClick,
+  onThreadHover,
   editorRef,
 }: EditorProps) {
   const annotationsRef = useRef<AnnotationWithColor[]>([]);
+  const commentThreadsRef = useRef<CommentThread[]>([]);
   const activeIdRef = useRef<string | null>(null);
+  const activeThreadIdRef = useRef<string | null>(null);
   const onClickRef = useRef<(id: string) => void>(() => {});
   const onHoverRef = useRef<(id: string | null, rect?: DOMRect) => void>(() => {});
+  const onThreadClickRef = useRef<(id: string, rect?: DOMRect) => void>(() => {});
+  const onThreadHoverRef = useRef<(id: string | null, rect?: DOMRect) => void>(() => {});
 
-  // Keep refs in sync with props
-  annotationsRef.current = annotations;
-  activeIdRef.current = activeAnnotationId;
-  onClickRef.current = onAnnotationClick ?? (() => {});
-  onHoverRef.current = onAnnotationHover ?? (() => {});
+  useEffect(() => {
+    annotationsRef.current = annotations;
+    commentThreadsRef.current = commentThreads;
+    activeIdRef.current = activeAnnotationId;
+    activeThreadIdRef.current = activeThreadId;
+    onClickRef.current = onAnnotationClick ?? (() => {});
+    onHoverRef.current = onAnnotationHover ?? (() => {});
+    onThreadClickRef.current = onThreadClick ?? (() => {});
+    onThreadHoverRef.current = onThreadHover ?? (() => {});
+  }, [
+    activeAnnotationId,
+    activeThreadId,
+    annotations,
+    commentThreads,
+    onAnnotationClick,
+    onAnnotationHover,
+    onThreadClick,
+    onThreadHover,
+  ]);
 
   const editor = useEditor({
     extensions: [
@@ -49,6 +77,7 @@ export function Editor({
         placeholder: "Start drafting your document...",
       }),
       ReviewAnnotationsExtension,
+      CommentThreadsExtension,
     ],
     content: "",
     immediatelyRender: false,
@@ -72,6 +101,16 @@ export function Editor({
       storage.onClickRef = onClickRef;
       storage.onHoverRef = onHoverRef;
     }
+    const commentExt = editor.extensionManager.extensions.find(
+      (e) => e.name === "commentThreads"
+    );
+    if (commentExt?.storage) {
+      const storage = commentExt.storage as Record<string, unknown>;
+      storage.threadsRef = commentThreadsRef;
+      storage.activeThreadIdRef = activeThreadIdRef;
+      storage.onClickRef = onThreadClickRef;
+      storage.onHoverRef = onThreadHoverRef;
+    }
   }, [editor]);
 
   // Force decoration recalculation when annotations or activeId change
@@ -79,7 +118,7 @@ export function Editor({
     if (!editor || editor.isDestroyed) return;
     // Dispatch an empty transaction to trigger plugin's apply()
     editor.view.dispatch(editor.state.tr);
-  }, [editor, annotations, activeAnnotationId]);
+  }, [editor, annotations, activeAnnotationId, commentThreads, activeThreadId]);
 
   // Expose editor to parent
   useEffect(() => {

@@ -8,7 +8,6 @@ import type {
   Reviewer,
   ReviewSummaryFE,
   RolloutHistoryEvent,
-  ShadowReviewSnapshot,
 } from "@/lib/store";
 import { CrewIdentityCard } from "@/components/crew/CrewIdentityCard";
 import { CrewIdentityEditorModal } from "@/components/crew/CrewIdentityEditorModal";
@@ -35,7 +34,6 @@ interface AgenticHubShellProps {
   reviewSummary: ReviewSummaryFE | null;
   llmTelemetry: LlmTelemetryEvent[];
   hubEvents?: HubEvent[];
-  shadowReview?: ShadowReviewSnapshot;
   rolloutHistory?: RolloutHistoryEvent[];
   isSavingCrewMember?: boolean;
   onRefreshCrewVersions?: () => void;
@@ -88,7 +86,6 @@ export function AgenticHubShell({
   reviewSummary,
   llmTelemetry,
   hubEvents = [],
-  shadowReview,
   rolloutHistory = [],
   isSavingCrewMember = false,
   onRefreshCrewVersions,
@@ -397,28 +394,6 @@ export function AgenticHubShell({
               </article>
             ))}
           </div>
-        )}
-      </div>
-
-      <div className={blockClass}>
-        <div className="mb-1 flex items-center justify-between">
-          <h3 className="text-sm font-semibold text-[var(--text-primary)]">Shadow Concordia</h3>
-          <span className="text-[11px] uppercase tracking-[0.12em] text-[var(--text-tertiary)]">Phase 1</span>
-        </div>
-        {!shadowReview || shadowReview.status === "idle" ? (
-          <p className="text-xs text-[var(--text-secondary)]">No shadow run yet.</p>
-        ) : shadowReview.status === "running" ? (
-          <p className="text-xs text-[var(--status-warning)]">Shadow run in progress.</p>
-        ) : shadowReview.status === "error" ? (
-          <p className="text-xs text-[var(--status-error)]">
-            Failed: {shadowReview.error || "unknown error"}
-          </p>
-        ) : (
-          <p className="text-xs text-[var(--text-secondary)]">
-            Agreement {Math.round((shadowReview.decision_agreement_rate || 0) * 100)}%, precision{" "}
-            {Math.round((shadowReview.precision_proxy || 0) * 100)}%, recall{" "}
-            {Math.round((shadowReview.recall_proxy || 0) * 100)}%.
-          </p>
         )}
       </div>
 

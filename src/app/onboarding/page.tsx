@@ -5,7 +5,6 @@ import { useEffect, useMemo, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useAppStore, type WorkspaceDefinition } from "@/lib/store";
 import { streamOnboardingWorkspace, type OnboardingWorkspaceEventName } from "@/lib/api";
-import { RoleCard } from "@/components/onboarding/RoleCard";
 import {
   MultiSelectField,
   ChipsField,
@@ -62,6 +61,43 @@ const companyStageOptions = [
   { value: "enterprise", label: "Enterprise (Series D+)" },
 ];
 
+const titleQuickPicks = [
+  { label: "Founder / CEO", value: "growth_marketing_manager" },
+  { label: "Product Marketing Manager", value: "product_marketing_manager" },
+  { label: "Demand Gen Manager", value: "demand_gen_manager" },
+  { label: "Content Marketing Manager", value: "content_marketing_manager" },
+  { label: "Account Executive", value: "account_executive" },
+  { label: "Customer Success Manager", value: "customer_success_manager" },
+];
+
+const titleKeywordMappings: Array<{ value: string; keywords: string[] }> = [
+  { value: "product_marketing_manager", keywords: ["product marketing", "pmm", "go to market", "go-to-market"] },
+  { value: "content_marketing_manager", keywords: ["content marketing", "content lead", "editorial", "seo"] },
+  { value: "demand_gen_manager", keywords: ["demand gen", "demand generation", "performance marketing", "pipeline"] },
+  { value: "account_executive", keywords: ["account executive", "sales rep", "seller", "closing"] },
+  { value: "customer_success_manager", keywords: ["customer success", "csm", "retention", "renewal"] },
+  { value: "sales_enablement_manager", keywords: ["sales enablement", "enablement"] },
+  { value: "growth_marketing_manager", keywords: ["growth", "founder", "ceo", "operator"] },
+  { value: "partner_marketing_manager", keywords: ["partner marketing", "partnership"] },
+  { value: "field_marketing_manager", keywords: ["field marketing", "events marketing"] },
+  { value: "brand_manager", keywords: ["brand", "brand marketing"] },
+  { value: "communications_manager", keywords: ["communications", "comms", "pr", "public relations"] },
+  { value: "solutions_engineer", keywords: ["solutions engineer", "sales engineer", "solution consultant"] },
+];
+
+function inferJobFunctionFromTitle(title: string): string {
+  const normalized = title.trim().toLowerCase();
+  if (!normalized) return "product_marketing_manager";
+
+  for (const mapping of titleKeywordMappings) {
+    if (mapping.keywords.some((keyword) => normalized.includes(keyword))) {
+      return mapping.value;
+    }
+  }
+
+  return "product_marketing_manager";
+}
+
 interface UIField {
   id: string;
   type: string;
@@ -109,13 +145,12 @@ export default function OnboardingPage() {
   const router = useRouter();
   const { setOnboarding, setUserProfile } = useAppStore();
 
-  // Step state (1-3)
-  const [step, setStep] = useState(1);
+  // Step state (0-3)
+  const [step, setStep] = useState(0);
 
-  // Step 1: Role selection
+  // Step 1: Title capture
+  const [jobTitle, setJobTitle] = useState<string>("");
   const [jobFunction, setJobFunction] = useState<string>("");
-  const [showMoreRoles, setShowMoreRoles] = useState(false);
-  const [roleSearch, setRoleSearch] = useState("");
 
   // Step 2: Team context
   const [teamSize, setTeamSize] = useState("");
@@ -133,6 +168,8 @@ export default function OnboardingPage() {
   const [workspaceEvents, setWorkspaceEvents] = useState<string[]>([]);
   const [workspaceTokenCount, setWorkspaceTokenCount] = useState(0);
   const [currentAdaptiveQuestionIndex, setCurrentAdaptiveQuestionIndex] = useState(0);
+  const [titleError, setTitleError] = useState<string | null>(null);
+  const [contextError, setContextError] = useState<string | null>(null);
 
   const adaptiveQuestions = useMemo<AdaptiveQuestion[]>(
     () =>
@@ -149,16 +186,10 @@ export default function OnboardingPage() {
   const totalAdaptiveQuestions = adaptiveQuestions.length;
   const isLastAdaptiveQuestion =
     totalAdaptiveQuestions > 0 && currentAdaptiveQuestionIndex === totalAdaptiveQuestions - 1;
-
-  // Filter roles by search
-  const filteredRoles = roleSearch
-    ? jobFunctions.filter(f =>
-        f.label.toLowerCase().includes(roleSearch.toLowerCase()) ||
-        f.description.toLowerCase().includes(roleSearch.toLowerCase())
-      )
-    : jobFunctions;
-
-  const displayedRoles = showMoreRoles ? filteredRoles : filteredRoles.slice(0, 6);
+  const inferredJobLabel = useMemo(() => {
+    const inferred = jobTitle.trim() ? inferJobFunctionFromTitle(jobTitle) : jobFunction;
+    return jobFunctions.find((func) => func.value === inferred)?.label ?? "GTM Operator";
+  }, [jobFunction, jobTitle]);
   const teamQuestionsAnswered = [teamSize, reportingLevel, industry, companyStage].filter(Boolean).length;
   const canShowReportingLevel = Boolean(teamSize);
   const canShowIndustry = Boolean(reportingLevel);
@@ -170,13 +201,29 @@ export default function OnboardingPage() {
   }, [questionsUISchema]);
 
   // Step 1 → Step 2
-  const handleRoleSubmit = () => {
-    if (!jobFunction) return;
+  const handleTitleSubmit = () => {
+    const normalizedTitle = jobTitle.trim();
+    if (!normalizedTitle) {
+      setTitleError("Please enter your title to continue.");
+      return;
+    }
+    setTitleError(null);
+    setJobFunction("");
     setStep(2);
   };
 
   // Step 2 → Step 3 (generate adaptive questions)
   const handleContextSubmit = async () => {
+    if (!jobTitle.trim() && !jobFunction) {
+      setContextError("Missing role context. Please go back and enter your title.");
+      return;
+    }
+    if (!reportingLevel) {
+      setContextError("Please choose your reporting level.");
+      return;
+    }
+    setContextError(null);
+
     setLoadingQuestions(true);
 
     try {
@@ -184,7 +231,8 @@ export default function OnboardingPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          job_function: jobFunction,
+          job_function: jobFunction || undefined,
+          job_title: jobTitle.trim(),
           team_size: teamSize,
           reporting_level: reportingLevel,
           industry: industry,
@@ -193,10 +241,16 @@ export default function OnboardingPage() {
         }),
       });
 
-      if (!response.ok) throw new Error("Failed to generate questions");
+      if (!response.ok) {
+        const payload = await response.json().catch(() => ({ detail: "Failed to generate questions" }));
+        throw new Error(typeof payload.detail === "string" ? payload.detail : "Failed to generate questions");
+      }
 
       const data = await response.json();
       setQuestionsUISchema(data.ui_schema);
+      if (data?.questions_context?.job_function && typeof data.questions_context.job_function === "string") {
+        setJobFunction(data.questions_context.job_function);
+      }
 
       // Initialize answers
       const initialAnswers: Record<string, unknown> = {};
@@ -216,7 +270,8 @@ export default function OnboardingPage() {
       setStep(3);
     } catch (error) {
       console.error("Error generating questions:", error);
-      alert("Failed to generate questions. Please try again.");
+      const message = error instanceof Error ? error.message : "Failed to generate questions. Please try again.";
+      setContextError(message);
     } finally {
       setLoadingQuestions(false);
     }
@@ -225,14 +280,22 @@ export default function OnboardingPage() {
   // Step 3 → Complete profile and go to project wizard
   const handleGoalsSubmit = async () => {
     if (generatingWorkspace) return;
+    const resolvedJobFunction = jobFunction || inferJobFunctionFromTitle(jobTitle);
+    if (!resolvedJobFunction) {
+      setContextError("Could not resolve your role. Please go back and confirm title + reporting level.");
+      return;
+    }
 
     const profile = {
-      job_function: jobFunction,
+      job_function: resolvedJobFunction,
       team_size: teamSize,
       reporting_level: reportingLevel,
       industry: industry,
       company_stage: companyStage,
-      current_work: answers,
+      current_work: {
+        ...answers,
+        job_title: jobTitle.trim(),
+      },
     };
 
     setGeneratingWorkspace(true);
@@ -244,8 +307,13 @@ export default function OnboardingPage() {
     try {
       const streamed = await streamOnboardingWorkspace(
         {
-          job_function: jobFunction,
+          job_function: resolvedJobFunction,
+          job_title: jobTitle.trim(),
           answers,
+          team_size: teamSize,
+          reporting_level: reportingLevel,
+          industry,
+          company_stage: companyStage,
         },
         (event: OnboardingWorkspaceEventName, data: unknown) => {
           if (event === "status" && data && typeof data === "object") {
@@ -315,7 +383,7 @@ export default function OnboardingPage() {
     }
 
     setOnboarding({
-      job_function: jobFunction,
+      job_function: resolvedJobFunction,
       workspace: generatedWorkspace,
       completed: true,
     });
@@ -458,36 +526,79 @@ export default function OnboardingPage() {
         </div>
 
         {/* Progress indicator */}
-        <div className="flex items-center justify-center gap-3 mb-12">
-          {[1, 2, 3].map((i) => (
-            <div key={i} className="flex items-center">
-              <div
-                className={`
-                  w-10 h-10 rounded-full flex items-center justify-center text-sm font-medium
-                  transition-all duration-300
-                  ${step >= i
-                    ? "bg-[#8b7355] text-white shadow-[0_2px_8px_rgba(139,115,85,0.2)]"
-                    : "bg-white border border-[#e8e6e1] text-[#9a9a94]"
-                  }
-                `}
-              >
-                {i}
-              </div>
-              {i < 3 && (
+        {step > 0 && (
+          <div className="flex items-center justify-center gap-3 mb-12">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="flex items-center">
                 <div
                   className={`
-                    w-20 h-0.5 transition-all duration-300
-                    ${step > i ? "bg-[#8b7355]" : "bg-[#e8e6e1]"}
+                    w-10 h-10 rounded-full flex items-center justify-center text-sm font-medium
+                    transition-all duration-300
+                    ${step >= i
+                      ? "bg-[#8b7355] text-white shadow-[0_2px_8px_rgba(139,115,85,0.2)]"
+                      : "bg-white border border-[#e8e6e1] text-[#9a9a94]"
+                    }
                   `}
-                />
-              )}
-            </div>
-          ))}
-        </div>
+                >
+                  {i}
+                </div>
+                {i < 3 && (
+                  <div
+                    className={`
+                      w-20 h-0.5 transition-all duration-300
+                      ${step > i ? "bg-[#8b7355]" : "bg-[#e8e6e1]"}
+                    `}
+                  />
+                )}
+              </div>
+            ))}
+          </div>
+        )}
 
         {/* Step content */}
         <AnimatePresence mode="wait">
-          {/* Step 1: Role Selection */}
+          {/* Step 0: Welcome */}
+          {step === 0 && (
+            <motion.div
+              key="step0"
+              initial={{ opacity: 0, y: 20 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: -20 }}
+              transition={{ duration: 0.3 }}
+            >
+              <div className="mx-auto max-w-3xl rounded-2xl border border-[#e8e6e1] bg-white/80 p-10 shadow-[0_14px_36px_rgba(45,45,42,0.08)]">
+                <h1 className="text-center text-4xl font-semibold text-[#2d2d2a] tracking-tight">
+                  Build your first agentic workspace in 2 minutes
+                </h1>
+                <p className="mx-auto mt-4 max-w-2xl text-center text-lg text-[#6b6b63]">
+                  We personalize your first project, doers, and reviewers so you can start with useful output instead
+                  of a blank page.
+                </p>
+                <div className="mt-8 grid grid-cols-1 gap-3 text-sm text-[#47473f] md:grid-cols-3">
+                  <div className="rounded-xl border border-[#e8e6e1] bg-[#fafaf8] p-4">
+                    Personalized crew and prompts
+                  </div>
+                  <div className="rounded-xl border border-[#e8e6e1] bg-[#fafaf8] p-4">
+                    Starter project and document scaffold
+                  </div>
+                  <div className="rounded-xl border border-[#e8e6e1] bg-[#fafaf8] p-4">
+                    You can edit everything afterward
+                  </div>
+                </div>
+                <div className="mt-8 flex items-center justify-between">
+                  <span className="text-sm text-[#9a9a94]">Takes about 2 minutes</span>
+                  <button
+                    onClick={() => setStep(1)}
+                    className="gradient-button"
+                  >
+                    Start Setup
+                  </button>
+                </div>
+              </div>
+            </motion.div>
+          )}
+
+          {/* Step 1: Title Capture */}
           {step === 1 && (
             <motion.div
               key="step1"
@@ -498,53 +609,63 @@ export default function OnboardingPage() {
             >
               <div className="text-center mb-8">
                 <h1 className="text-4xl font-semibold text-[#2d2d2a] mb-3 tracking-tight">
-                  What&apos;s your job function?
+                  What&apos;s your title?
                 </h1>
                 <p className="text-lg text-[#6b6b63]">
-                  We&apos;ll personalize your workspace based on your role
+                  Enter it naturally. We&apos;ll map it behind the scenes.
                 </p>
               </div>
 
-              {/* Search bar */}
-              <div className="mb-6">
+              <div className="mx-auto max-w-3xl">
                 <input
                   type="text"
-                  placeholder="Search roles..."
-                  value={roleSearch}
-                  onChange={(e) => setRoleSearch(e.target.value)}
+                  data-testid="title-input"
+                  placeholder="e.g. Founder, Product Marketing Manager, Sales Lead"
+                  value={jobTitle}
+                  onChange={(e) => {
+                    const value = e.target.value;
+                    setJobTitle(value);
+                    setTitleError(null);
+                  }}
                   className="glass-input"
                 />
+                {titleError && (
+                  <p className="mt-2 text-sm text-[#b9382d]">{titleError}</p>
+                )}
+                <p className="mt-3 text-sm text-[#8a867f]">
+                  We&apos;ll tailor your setup as: <span className="font-medium text-[#5f533f]">{inferredJobLabel}</span>
+                </p>
+                <div className="mt-6">
+                  <p className="mb-3 text-sm text-[#6b6b63]">Quick picks</p>
+                  <div className="flex flex-wrap gap-2">
+                    {titleQuickPicks.map((pick) => (
+                      <button
+                        key={pick.label}
+                        type="button"
+                        data-testid={`title-quick-pick-${pick.value}`}
+                        onClick={() => {
+                          setJobTitle(pick.label);
+                          setJobFunction("");
+                          setTitleError(null);
+                        }}
+                        className={`rounded-full border px-4 py-2 text-sm transition-all ${
+                          inferJobFunctionFromTitle(jobTitle) === pick.value
+                            ? "border-[#8b7355] bg-[#f3ece2] text-[#5f533f]"
+                            : "border-[#ddd9d2] bg-white text-[#57574f] hover:border-[#c9c2b7]"
+                        }`}
+                      >
+                        {pick.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
               </div>
-
-              {/* Role cards grid */}
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 mb-6">
-                {displayedRoles.map((func) => (
-                  <RoleCard
-                    key={func.value}
-                    roleId={func.value}
-                    title={func.label}
-                    description={func.description}
-                    selected={jobFunction === func.value}
-                    onClick={() => setJobFunction(func.value)}
-                  />
-                ))}
-              </div>
-
-              {/* See more button */}
-              {!showMoreRoles && filteredRoles.length > 6 && (
-                <button
-                  onClick={() => setShowMoreRoles(true)}
-                  className="w-full py-3 text-[#6b6b63] hover:text-[#8b7355] transition-colors"
-                >
-                  See {filteredRoles.length - 6} more roles
-                </button>
-              )}
 
               {/* Continue button */}
               <div className="flex justify-end mt-8">
                 <button
-                  onClick={handleRoleSubmit}
-                  disabled={!jobFunction}
+                  onClick={handleTitleSubmit}
+                  disabled={!jobTitle.trim()}
                   className="gradient-button disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   Continue
@@ -719,6 +840,9 @@ export default function OnboardingPage() {
               </div>
 
               {/* Navigation */}
+              {contextError && (
+                <p className="mt-4 text-sm text-[#b9382d]">{contextError}</p>
+              )}
               <div className="flex justify-between mt-8">
                 <button
                   onClick={() => setStep(1)}

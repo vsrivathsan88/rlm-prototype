@@ -100,12 +100,43 @@ export interface BackendLlmRouteAttempt {
   error?: string;
 }
 
+export interface BackendContextFileSummary {
+  filename: string;
+  chars: number;
+  preview: string;
+}
+
+export interface BackendCitationTrace {
+  filename: string;
+  quote: string;
+  why?: string;
+  line_start?: number | null;
+  line_end?: number | null;
+}
+
+export interface BackendToolCallTrace {
+  tool_name: string;
+  source: string;
+  file?: string | null;
+  status?: string;
+  bytes_read?: number | null;
+  timestamp?: string | null;
+}
+
 export interface BackendLlmRouteEvent {
+  trace_id?: string;
   task: string;
   provider: string;
   model: string;
   fallback_used: boolean;
   rollout_mode?: string;
+  context_files?: string[];
+  context_file_count?: number;
+  context_file_summaries?: BackendContextFileSummary[];
+  reasoning_summary?: string;
+  citations?: BackendCitationTrace[];
+  evidence_gaps?: string[];
+  tool_calls?: BackendToolCallTrace[];
   attempts: BackendLlmRouteAttempt[];
 }
 
@@ -114,25 +145,6 @@ export interface BackendReviewResponse {
   results: BackendReviewResult[];
   conflicts: BackendConflict[];
   llm_meta?: BackendLlmRouteEvent[];
-}
-
-export interface ShadowReviewRequestPayload extends ReviewRequestPayload {
-  candidate_judge_ids?: string[];
-  candidate_reviewer_context?: ReviewRequestPayload["reviewer_context"];
-}
-
-export interface BackendShadowComparison {
-  pair_count: number;
-  decision_agreement_rate: number;
-  precision_proxy: number;
-  recall_proxy: number;
-  mean_score_delta: number;
-}
-
-export interface BackendShadowReviewResponse {
-  baseline: BackendReviewResponse;
-  candidate: BackendReviewResponse;
-  comparison: BackendShadowComparison;
 }
 
 export interface ReplExecRequestPayload {
@@ -157,23 +169,6 @@ export async function reviewDocument(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ detail: "Review request failed" }));
-    throw new Error(error.detail || `HTTP ${response.status}`);
-  }
-
-  return response.json();
-}
-
-export async function reviewDocumentShadow(
-  payload: ShadowReviewRequestPayload
-): Promise<BackendShadowReviewResponse> {
-  const response = await fetch(`${API_BASE}/v1/documents/review/shadow`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-  });
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: "Shadow review request failed" }));
     throw new Error(error.detail || `HTTP ${response.status}`);
   }
 
@@ -391,14 +386,14 @@ export async function rollbackCrewVersion(
 
 export interface SetRolloutModeResponse {
   project_id: string;
-  mode: "baseline" | "shadow" | "active";
+  mode: "baseline" | "active";
   updated_at: string;
   effective_from_next_run: boolean;
 }
 
 export interface RolloutHistoryEvent {
-  mode: "baseline" | "shadow" | "active";
-  from_mode?: "baseline" | "shadow" | "active";
+  mode: "baseline" | "active";
+  from_mode?: "baseline" | "active";
   updated_at: string;
   reason?: string;
   source: "init" | "manual" | "auto_fallback" | "migration" | "hydrate";
@@ -412,7 +407,7 @@ export interface RolloutHistoryResponse {
 
 export async function setProjectRolloutMode(
   projectId: string,
-  mode: "baseline" | "shadow" | "active",
+  mode: "baseline" | "active",
   reason?: string
 ): Promise<SetRolloutModeResponse> {
   const response = await fetch(`${API_BASE}/v1/projects/${projectId}/rollout-mode`, {
@@ -442,8 +437,14 @@ export async function getProjectRolloutHistory(
 
 export interface OnboardingWorkspaceStreamRequest {
   job_function: string;
+  job_title?: string;
   answers: Record<string, unknown>;
   email?: string;
+  team_size?: string;
+  reporting_level?: string;
+  industry?: string;
+  company_stage?: string;
+  company_info?: Record<string, unknown>;
 }
 
 export interface OnboardingWorkspaceStreamComplete {
@@ -674,4 +675,243 @@ export async function streamProjectSync(
 
   if (completePayload) return completePayload;
   throw new Error("Project sync stream ended before completion payload");
+}
+
+function adminHeaders(adminKey?: string): Record<string, string> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    "x-user-role": "admin",
+  };
+  if (adminKey && adminKey.trim()) headers["x-admin-key"] = adminKey.trim();
+  return headers;
+}
+
+export interface EvalRunSummary {
+  run_id: string;
+  file_name: string;
+  created_at?: string | null;
+  model?: string | null;
+  dataset?: string | null;
+  cases?: number | null;
+  failed_cases?: number | null;
+  aggregate?: Record<string, unknown>;
+}
+
+export interface EvalCaseAnnotation {
+  run_id: string;
+  case_id: string;
+  winner?: string | null;
+  label?: string | null;
+  action?: string | null;
+  note?: string | null;
+  tags?: string[];
+  actor?: string | null;
+  updated_at?: string | null;
+}
+
+export interface EvalCaseResult {
+  id: string;
+  vanilla?: Record<string, unknown> | null;
+  rlm?: Record<string, unknown> | null;
+  error?: string;
+}
+
+export interface EvalRunDetailResponse {
+  run_id: string;
+  summary: {
+    timestamp?: string;
+    model?: string;
+    dataset?: string;
+    cases?: number;
+    failed_cases?: number;
+    aggregate?: Record<string, unknown>;
+  };
+  results: EvalCaseResult[];
+  annotations: Record<string, EvalCaseAnnotation>;
+}
+
+export async function listAdminEvalRuns(
+  limit = 50,
+  adminKey?: string
+): Promise<{ count: number; runs: EvalRunSummary[] }> {
+  const response = await fetch(`${API_BASE}/v1/admin/evals/runs?limit=${encodeURIComponent(limit)}`, {
+    method: "GET",
+    headers: adminHeaders(adminKey),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to load eval runs" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function getAdminEvalRun(
+  runId: string,
+  adminKey?: string
+): Promise<EvalRunDetailResponse> {
+  const response = await fetch(`${API_BASE}/v1/admin/evals/runs/${encodeURIComponent(runId)}`, {
+    method: "GET",
+    headers: adminHeaders(adminKey),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to load eval run" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export interface EvalCaseAnnotationPayload {
+  winner?: string | null;
+  label?: string | null;
+  action?: string | null;
+  note?: string | null;
+  tags?: string[];
+}
+
+export async function annotateAdminEvalCase(
+  runId: string,
+  caseId: string,
+  payload: EvalCaseAnnotationPayload,
+  adminKey?: string,
+  adminUser?: string
+): Promise<{ ok: boolean; annotation: EvalCaseAnnotation }> {
+  const headers = adminHeaders(adminKey);
+  if (adminUser && adminUser.trim()) headers["x-admin-user"] = adminUser.trim();
+  const response = await fetch(
+    `${API_BASE}/v1/admin/evals/runs/${encodeURIComponent(runId)}/cases/${encodeURIComponent(caseId)}/annotation`,
+    {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to annotate eval case" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export interface AdminModelRegistryEntry {
+  provider: string;
+  model: string;
+  name: string;
+  enabled: boolean;
+  tags?: string[];
+}
+
+export async function listAdminModels(
+  adminKey?: string
+): Promise<{ count: number; models: AdminModelRegistryEntry[] }> {
+  const response = await fetch(`${API_BASE}/v1/admin/models`, {
+    method: "GET",
+    headers: adminHeaders(adminKey),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to load admin models" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function updateAdminModel(
+  payload: {
+    provider: string;
+    model: string;
+    enabled: boolean;
+    name?: string;
+    tags?: string[];
+  },
+  adminKey?: string
+): Promise<{ ok: boolean; model: AdminModelRegistryEntry }> {
+  const response = await fetch(`${API_BASE}/v1/admin/models/update`, {
+    method: "POST",
+    headers: adminHeaders(adminKey),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to update model" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+function userHeaders(userId?: string): Record<string, string> {
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (userId && userId.trim()) headers["x-user-id"] = userId.trim();
+  return headers;
+}
+
+export interface UserApiKeyMeta {
+  provider: string;
+  label?: string | null;
+  base_url?: string | null;
+  last4?: string | null;
+  updated_at?: string | null;
+}
+
+export async function listUserApiKeys(
+  userId?: string
+): Promise<{ user_id: string; count: number; keys: UserApiKeyMeta[] }> {
+  const response = await fetch(`${API_BASE}/v1/user/keys`, {
+    method: "GET",
+    headers: userHeaders(userId),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to load user keys" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function upsertUserApiKey(
+  payload: {
+    provider: string;
+    api_key: string;
+    label?: string;
+    base_url?: string;
+  },
+  userId?: string
+): Promise<{ ok: boolean; user_id: string; key: UserApiKeyMeta }> {
+  const response = await fetch(`${API_BASE}/v1/user/keys`, {
+    method: "POST",
+    headers: userHeaders(userId),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to save user key" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function testUserApiKey(
+  payload: { provider: string; api_key?: string; base_url?: string },
+  userId?: string
+): Promise<{ ok: boolean; status_code: number; endpoint: string; detail?: string }> {
+  const response = await fetch(`${API_BASE}/v1/user/keys/test`, {
+    method: "POST",
+    headers: userHeaders(userId),
+    body: JSON.stringify(payload),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to test user key" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function deleteUserApiKey(
+  provider: string,
+  userId?: string
+): Promise<{ ok: boolean; user_id: string; provider: string }> {
+  const response = await fetch(`${API_BASE}/v1/user/keys/${encodeURIComponent(provider)}`, {
+    method: "DELETE",
+    headers: userHeaders(userId),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ detail: "Failed to delete user key" }));
+    throw new Error(error.detail || `HTTP ${response.status}`);
+  }
+  return response.json();
 }

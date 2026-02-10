@@ -118,9 +118,8 @@ export type DomainProject = {
   owner?: DomainUserProfile;
   profile_context?: DomainUserProfile;
   active_crew_version_id?: string;
-  rolloutMode?: "baseline" | "shadow" | "active";
+  rolloutMode?: "baseline" | "active";
   rolloutHistory?: unknown[];
-  shadowReview?: unknown;
 };
 
 export type HubActorType = "doer" | "reviewer" | "system";

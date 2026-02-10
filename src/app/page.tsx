@@ -3,9 +3,12 @@
 import { useEffect, useMemo, useState, useCallback, useRef } from "react";
 import { useRouter } from "next/navigation";
 import {
+  type CommandRunTrace,
   useAppStore,
+  type CommentThread,
   type EscalationState,
   type Project,
+  type ReviewAnnotation,
   type ReviewResultFE,
   type ReviewSummaryFE,
 } from "@/lib/store";
@@ -14,10 +17,10 @@ import { Sidebar } from "@/components/layout/Sidebar";
 import { Editor } from "@/components/workspace/Editor";
 import { CommandPanel } from "@/components/workspace/CommandPanel";
 import { RightPanel } from "@/components/workspace/RightPanel";
-import { RolloutHistoryModal } from "@/components/workspace/RolloutHistoryModal";
 import { WelcomeModal } from "@/components/workspace/WelcomeModal";
 import { FileSearch } from "@/components/workspace/FileSearch";
 import { AnnotationTooltip } from "@/components/workspace/AnnotationTooltip";
+import { ThreadBubble } from "@/components/workspace/ThreadBubble";
 import { Button } from "@/components/ui/Button";
 import { notify } from "@/components/ui/NotificationCenter";
 import { runReview } from "@/lib/review-orchestrator";
@@ -30,23 +33,13 @@ import {
   parseMentionTokens,
   stripMentionTokens,
 } from "@/lib/mentions";
+import { buildLineMap, linesToPositions } from "@/lib/line-position-map";
 import {
   execProjectRepl,
   getCrewVersions,
-  getProjectRolloutHistory,
-  reviewDocumentShadow,
-  setProjectRolloutMode,
   streamProjectSync,
   type BackendLlmRouteEvent,
 } from "@/lib/api";
-
-function promoteStrictness(
-  strictness: "low" | "medium" | "high" | undefined
-): "low" | "medium" | "high" {
-  if (strictness === "low") return "medium";
-  if (strictness === "medium") return "high";
-  return "high";
-}
 
 const DEFAULT_CAPACITY_POLICY = {
   maxConcurrentDoers: 3,
@@ -101,6 +94,253 @@ function buildEscalationFromReview(
   return null;
 }
 
+function hashThreadId(seed: string): string {
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i += 1) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `thread-${(hash >>> 0).toString(36)}`;
+}
+
+function parseReplacementFromMessage(message: string): string | null {
+  const quotedMatch = message.match(
+    /\b(?:replace|change|rewrite|use)\b[^"'`]*["']([^"']{2,220})["']/i
+  );
+  const candidate = quotedMatch?.[1]?.trim();
+  return candidate ? candidate : null;
+}
+
+function buildCommentThreadsFromResults(
+  projectId: string,
+  results: ReviewResultFE[],
+  editor: TiptapEditor
+): CommentThread[] {
+  const now = new Date().toISOString();
+  const threads: CommentThread[] = [];
+  const docSize = editor.state.doc.content.size;
+  const lineMap = buildLineMap(editor.state.doc);
+  const clampPos = (pos: number): number =>
+    Math.max(1, Math.min(Math.max(1, docSize), Math.floor(pos)));
+
+  for (const result of results) {
+    for (const annotation of result.annotations) {
+      const mapped = linesToPositions(lineMap, annotation.startLine, annotation.endLine);
+      let startPos = clampPos(annotation.startPos ?? mapped?.from ?? 1);
+      let endPos = clampPos(annotation.endPos ?? mapped?.to ?? Math.min(docSize, startPos + 1));
+      if (endPos <= startPos && docSize > 1) {
+        if (startPos < docSize) {
+          endPos = startPos + 1;
+        } else {
+          startPos = Math.max(1, startPos - 1);
+          endPos = Math.max(startPos + 1, endPos);
+        }
+      }
+      const selectedText = editor.state.doc.textBetween(startPos, endPos, "\n", "\n").trim();
+      const replacement = parseReplacementFromMessage(annotation.message);
+      const suggestion =
+        replacement && selectedText && replacement !== selectedText
+          ? {
+              id: `s-${annotation.id}`,
+              kind: "replace_range" as const,
+              status: "pending" as const,
+              from: startPos,
+              to: endPos,
+              original_text: selectedText,
+              replacement_text: replacement,
+            }
+          : undefined;
+
+      const key = `${projectId}:${annotation.judgeId}:${annotation.id}`;
+      threads.push({
+        id: hashThreadId(key),
+        key,
+        project_id: projectId,
+        annotation_id: annotation.id,
+        judge_id: annotation.judgeId,
+        judge_name: result.judgeName,
+        severity: annotation.severity,
+        status: "open",
+        anchor: {
+          startPos,
+          endPos,
+          startLine: annotation.startLine,
+          endLine: annotation.endLine,
+        },
+        color: result.color,
+        messages: [
+          {
+            id: `m-${annotation.id}`,
+            author_type: "reviewer",
+            author_name: result.judgeName,
+            body: annotation.message,
+            created_at: now,
+          },
+        ],
+        suggestion,
+        created_at: now,
+        updated_at: now,
+      });
+    }
+  }
+
+  const severityOrder: Record<ReviewAnnotation["severity"], number> = {
+    critical: 0,
+    warning: 1,
+    info: 2,
+  };
+  return threads.sort(
+    (a, b) =>
+      severityOrder[a.severity] - severityOrder[b.severity] ||
+      a.anchor.startLine - b.anchor.startLine
+  );
+}
+
+function nowMessageId(): string {
+  return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function parseAssistantOutput(raw: string): { answer: string; reasoning: string | null } {
+  if (!raw.trim()) return { answer: "", reasoning: null };
+
+  const reasoningBlocks: string[] = [];
+  let cleaned = raw.replace(/<think>([\s\S]*?)<\/think>/gi, (_match, content: string) => {
+    const value = content.trim();
+    if (value) reasoningBlocks.push(value);
+    return "";
+  });
+
+  if (reasoningBlocks.length === 0) {
+    const start = raw.indexOf("<think>");
+    if (start >= 0) {
+      const tail = raw.slice(start + "<think>".length);
+      const lines = tail.split("\n");
+      const answerStart = lines.findIndex(
+        (line) =>
+          /^(final answer|answer|response)\s*:/i.test(line.trim()) ||
+          line.trim().startsWith("</think>")
+      );
+      const reasoningChunk =
+        answerStart >= 0 ? lines.slice(0, answerStart).join("\n") : tail;
+      const reasoning = reasoningChunk.trim();
+      if (reasoning) reasoningBlocks.push(reasoning);
+      cleaned = answerStart >= 0 ? lines.slice(answerStart + 1).join("\n") : "";
+    }
+  }
+
+  const answer = cleaned
+    .replace(/<\/?think>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return { answer, reasoning: reasoningBlocks.join("\n\n").trim() || null };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function renderInlineMarkdown(text: string): string {
+  let rendered = escapeHtml(text);
+  rendered = rendered.replace(/`([^`]+)`/g, "<code>$1</code>");
+  rendered = rendered.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+  rendered = rendered.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+  return rendered;
+}
+
+function formatOutputAsRichHtml(text: string): string {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const chunks: string[] = [];
+  let inCode = false;
+  let codeLines: string[] = [];
+  let ulItems: string[] = [];
+  let olItems: string[] = [];
+  let paragraphLines: string[] = [];
+
+  const flushParagraph = () => {
+    if (!paragraphLines.length) return;
+    const content = renderInlineMarkdown(paragraphLines.join(" "));
+    chunks.push(`<p>${content}</p>`);
+    paragraphLines = [];
+  };
+  const flushList = () => {
+    if (ulItems.length) {
+      chunks.push(`<ul>${ulItems.map((item) => `<li>${item}</li>`).join("")}</ul>`);
+      ulItems = [];
+    }
+    if (olItems.length) {
+      chunks.push(`<ol>${olItems.map((item) => `<li>${item}</li>`).join("")}</ol>`);
+      olItems = [];
+    }
+  };
+  const flushCode = () => {
+    if (!codeLines.length) return;
+    chunks.push(`<pre><code>${escapeHtml(codeLines.join("\n"))}</code></pre>`);
+    codeLines = [];
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      flushParagraph();
+      flushList();
+      if (inCode) {
+        flushCode();
+        inCode = false;
+      } else {
+        inCode = true;
+      }
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      continue;
+    }
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      const level = heading[1].length;
+      chunks.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+    const ul = trimmed.match(/^[-*]\s+(.+)$/);
+    if (ul) {
+      flushParagraph();
+      olItems = [];
+      ulItems.push(renderInlineMarkdown(ul[1]));
+      continue;
+    }
+    const ol = trimmed.match(/^\d+\.\s+(.+)$/);
+    if (ol) {
+      flushParagraph();
+      ulItems = [];
+      olItems.push(renderInlineMarkdown(ol[1]));
+      continue;
+    }
+    flushList();
+    paragraphLines.push(trimmed);
+  }
+
+  flushParagraph();
+  flushList();
+  flushCode();
+
+  if (!chunks.length) {
+    return `<p>${renderInlineMarkdown(text)}</p>`;
+  }
+  return chunks.join("");
+}
+
 export default function Home() {
   const router = useRouter();
   const {
@@ -137,7 +377,6 @@ export default function Home() {
     []
   );
   const syncInFlightRef = useRef<string | null>(null);
-  const fallbackAlertRef = useRef<Record<string, string>>({});
   const crewHydrationRef = useRef<Record<string, string | null>>({});
 
   // Redirect to onboarding if user hasn't completed profile
@@ -150,15 +389,6 @@ export default function Home() {
       selectProject(projects[0].id);
     }
   }, [projects, selectedProject, selectProject, router, onboarding]);
-
-  // Phase 3 legacy-safe migration: existing projects without rollout mode remain baseline.
-  useEffect(() => {
-    const legacyProjects = projects.filter((project) => !project.rolloutMode);
-    if (!legacyProjects.length) return;
-    for (const project of legacyProjects) {
-      updateProject(project.id, { rolloutMode: "baseline" });
-    }
-  }, [projects, updateProject]);
 
   useEffect(() => {
     const projectsMissingOps = projects.filter(
@@ -178,8 +408,6 @@ export default function Home() {
 
   // File search state
   const [showFileSearch, setShowFileSearch] = useState(false);
-  const [showRolloutHistory, setShowRolloutHistory] = useState(false);
-  const [isRecoveringToActive, setIsRecoveringToActive] = useState(false);
 
   // Editor ref
   const editorRef = useRef<TiptapEditor | null>(null);
@@ -198,6 +426,7 @@ export default function Home() {
     annotationId: string;
     rect: DOMRect;
   } | null>(null);
+  const [threadBubbleRect, setThreadBubbleRect] = useState<DOMRect | null>(null);
 
   // Welcome modal state
   const showWelcomeModal = onboarding.completed && !onboarding.welcome_dismissed && projects.length > 0;
@@ -404,6 +633,246 @@ export default function Home() {
     [appendProjectDecision, setProjectEscalation]
   );
 
+  const updateThreadState = useCallback(
+    (threadId: string, updater: (thread: CommentThread) => CommentThread) => {
+      if (!selectedProject) return null;
+      const threads = selectedProject.commentThreads ?? [];
+      let updatedThread: CommentThread | null = null;
+      const nextThreads = threads.map((thread) => {
+        if (thread.id !== threadId) return thread;
+        updatedThread = updater(thread);
+        return updatedThread;
+      });
+      if (!updatedThread) return null;
+      updateProject(selectedProject.id, { commentThreads: nextThreads });
+      return updatedThread;
+    },
+    [selectedProject, updateProject]
+  );
+
+  const selectThread = useCallback(
+    (threadId: string, rect?: DOMRect) => {
+      if (!selectedProject) return;
+      let resolvedRect = rect ?? null;
+      if (!resolvedRect && typeof document !== "undefined") {
+        const marker = document.querySelector<HTMLElement>(`[data-thread-id="${threadId}"]`);
+        resolvedRect = marker?.getBoundingClientRect() ?? null;
+      }
+      if (!resolvedRect) {
+        const thread = (selectedProject.commentThreads ?? []).find((item) => item.id === threadId);
+        const pos = thread?.anchor.startPos;
+        if (pos != null && editorRef.current?.view) {
+          const view = editorRef.current.view;
+          const safePos = Math.max(1, Math.min(pos, view.state.doc.content.size));
+          const coords = view.coordsAtPos(safePos);
+          resolvedRect = new DOMRect(
+            coords.left,
+            coords.top,
+            Math.max(1, coords.right - coords.left),
+            Math.max(1, coords.bottom - coords.top)
+          );
+        }
+      }
+      updateProject(selectedProject.id, { activeThreadId: threadId });
+      setThreadBubbleRect(resolvedRect);
+    },
+    [selectedProject, updateProject]
+  );
+
+  const closeActiveThread = useCallback(() => {
+    if (!selectedProject) return;
+    updateProject(selectedProject.id, { activeThreadId: null });
+    setThreadBubbleRect(null);
+  }, [selectedProject, updateProject]);
+
+  const handleAcceptThreadSuggestion = useCallback(
+    (threadId: string) => {
+      const editor = editorRef.current;
+      if (!selectedProject || !editor) return;
+      const thread = (selectedProject.commentThreads ?? []).find((item) => item.id === threadId);
+      const suggestion = thread?.suggestion;
+      if (!thread || !suggestion || suggestion.status !== "pending") return;
+
+      editor
+        .chain()
+        .focus()
+        .insertContentAt({ from: suggestion.from, to: suggestion.to }, suggestion.replacement_text)
+        .run();
+      const now = new Date().toISOString();
+      const appliedTo = suggestion.from + suggestion.replacement_text.length;
+
+      updateThreadState(threadId, (current) => ({
+        ...current,
+        updated_at: now,
+        anchor: {
+          ...current.anchor,
+          endPos: appliedTo,
+        },
+        suggestion: {
+          ...suggestion,
+          status: "accepted",
+          applied_from: suggestion.from,
+          applied_to: appliedTo,
+          applied_at: now,
+        },
+        messages: [
+          ...current.messages,
+          {
+            id: nowMessageId(),
+            author_type: "system",
+            author_name: "System",
+            body: "Suggestion accepted and applied.",
+            created_at: now,
+          },
+        ],
+      }));
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "approve",
+        reason: `Accepted reviewer suggestion in ${thread.judge_name || "thread"}.`,
+        evidence_refs: thread.annotation_id ? [thread.annotation_id] : undefined,
+        impact_summary: "Applied reviewer text replacement in editor.",
+      });
+      notify.success("Suggestion Applied", "Reviewer suggestion has been inserted in the editor.");
+      selectThread(threadId);
+    },
+    [appendProjectDecision, selectThread, selectedProject, updateThreadState]
+  );
+
+  const handleRejectThreadSuggestion = useCallback(
+    (threadId: string) => {
+      if (!selectedProject) return;
+      const thread = (selectedProject.commentThreads ?? []).find((item) => item.id === threadId);
+      const suggestion = thread?.suggestion;
+      if (!thread || !suggestion || suggestion.status !== "pending") return;
+      const now = new Date().toISOString();
+
+      updateThreadState(threadId, (current) => ({
+        ...current,
+        updated_at: now,
+        suggestion: {
+          ...suggestion,
+          status: "rejected",
+        },
+        messages: [
+          ...current.messages,
+          {
+            id: nowMessageId(),
+            author_type: "human",
+            author_name: "You",
+            body: "Suggestion rejected.",
+            created_at: now,
+          },
+        ],
+      }));
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "reject",
+        reason: `Rejected reviewer suggestion in ${thread.judge_name || "thread"}.`,
+        evidence_refs: thread.annotation_id ? [thread.annotation_id] : undefined,
+        impact_summary: "Kept current editor text unchanged.",
+      });
+      notify.info("Suggestion Rejected", "Reviewer suggestion was marked as rejected.");
+    },
+    [appendProjectDecision, selectedProject, updateThreadState]
+  );
+
+  const handleRevertThreadSuggestion = useCallback(
+    (threadId: string) => {
+      const editor = editorRef.current;
+      if (!selectedProject || !editor) return;
+      const thread = (selectedProject.commentThreads ?? []).find((item) => item.id === threadId);
+      const suggestion = thread?.suggestion;
+      if (!thread || !suggestion || suggestion.status !== "accepted") return;
+
+      const from = suggestion.applied_from ?? suggestion.from;
+      const to = suggestion.applied_to ?? from + suggestion.replacement_text.length;
+
+      editor
+        .chain()
+        .focus()
+        .insertContentAt({ from, to }, suggestion.original_text)
+        .run();
+
+      const now = new Date().toISOString();
+      const restoredTo = from + suggestion.original_text.length;
+      updateThreadState(threadId, (current) => ({
+        ...current,
+        updated_at: now,
+        anchor: {
+          ...current.anchor,
+          endPos: restoredTo,
+        },
+        suggestion: {
+          ...suggestion,
+          status: "reverted",
+          applied_from: from,
+          applied_to: restoredTo,
+          applied_at: now,
+        },
+        messages: [
+          ...current.messages,
+          {
+            id: nowMessageId(),
+            author_type: "system",
+            author_name: "System",
+            body: "Accepted suggestion reverted to original text.",
+            created_at: now,
+          },
+        ],
+      }));
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "override",
+        reason: `Reverted accepted suggestion in ${thread.judge_name || "thread"}.`,
+        evidence_refs: thread.annotation_id ? [thread.annotation_id] : undefined,
+        impact_summary: "Restored the original text span.",
+      });
+      notify.info("Suggestion Reverted", "Original text has been restored.");
+      selectThread(threadId);
+    },
+    [appendProjectDecision, selectThread, selectedProject, updateThreadState]
+  );
+
+  const handleResolveThread = useCallback(
+    (threadId: string) => {
+      if (!selectedProject) return;
+      const thread = (selectedProject.commentThreads ?? []).find((item) => item.id === threadId);
+      if (!thread) return;
+      const now = new Date().toISOString();
+      updateThreadState(threadId, (current) => ({
+        ...current,
+        status: "resolved",
+        updated_at: now,
+        messages: [
+          ...current.messages,
+          {
+            id: nowMessageId(),
+            author_type: "human",
+            author_name: "You",
+            body: "Thread resolved.",
+            created_at: now,
+          },
+        ],
+      }));
+      if (selectedProject.activeThreadId === threadId) {
+        closeActiveThread();
+      }
+      appendProjectDecision(selectedProject.id, {
+        actor_type: "human",
+        actor_id: "current_user",
+        decision_type: "route_change",
+        reason: `Resolved thread from ${thread.judge_name || "reviewer"}.`,
+        evidence_refs: thread.annotation_id ? [thread.annotation_id] : undefined,
+        impact_summary: "Reviewer thread moved out of active queue.",
+      });
+    },
+    [appendProjectDecision, closeActiveThread, selectedProject, updateThreadState]
+  );
+
   const handleRunCommand = useCallback(async (prompt: string, model: string) => {
     if (!selectedProject) {
       notify.warning("No Project Selected", "Select a project before running a command.");
@@ -547,7 +1016,8 @@ export default function Home() {
     setIsRunning(true);
     try {
       const response = await execProjectRepl(selectedProject.id, { code });
-      for (const event of response.llm_meta || []) {
+      const llmEvents = response.llm_meta || [];
+      for (const event of llmEvents) {
         addLlmTelemetryEvent({
           id: `ev-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           task: event.task,
@@ -569,18 +1039,119 @@ export default function Home() {
         throw new Error(response.error);
       }
 
-      const output = (response.stdout || "").trim();
+      const rawOutput = (response.stdout || "").trim();
+      const parsedOutput = parseAssistantOutput(rawOutput);
+      const output =
+        parsedOutput.answer ||
+        (parsedOutput.reasoning
+          ? "No direct answer returned. Open Last Run in the right panel for reasoning and source context."
+          : rawOutput);
       if (output) {
         const editor = editorRef.current;
         if (editor) {
-          editor.chain().focus().insertContent(`\n\n${output}`).run();
-          notify.success("Command Complete", "Inserted output into the editor.");
+          const richHtml = formatOutputAsRichHtml(output);
+          editor.chain().focus().insertContent("<p></p>").insertContent(richHtml).run();
+          const hasReasoning = Boolean(parsedOutput.reasoning);
+          notify.success(
+            "Command Complete",
+            hasReasoning
+              ? "Inserted answer. Reasoning and sources are available in Last Run."
+              : "Inserted output into the editor."
+          );
         } else {
           notify.success("Command Complete", output.slice(0, 220));
         }
       } else {
         notify.info("Command Complete", "No output returned.");
       }
+
+      const contextFileSet = new Set<string>();
+      let contextFileCount = 0;
+      const toolCallList: Array<{
+        tool_name: string;
+        source: string;
+        file?: string | null;
+        status?: string;
+        bytes_read?: number | null;
+        timestamp?: string | null;
+      }> = [];
+      const contextSummaryByFile = new Map<string, { filename: string; chars: number; preview: string }>();
+      const citationKeySet = new Set<string>();
+      const citations: Array<{
+        filename: string;
+        quote: string;
+        why?: string;
+        line_start?: number | null;
+        line_end?: number | null;
+      }> = [];
+      const evidenceGapSet = new Set<string>();
+      for (const event of llmEvents) {
+        const files = Array.isArray(event.context_files) ? event.context_files : [];
+        for (const file of files) {
+          if (typeof file === "string" && file.trim()) contextFileSet.add(file);
+        }
+        const summaries = Array.isArray(event.context_file_summaries) ? event.context_file_summaries : [];
+        for (const summary of summaries) {
+          if (!summary?.filename) continue;
+          contextSummaryByFile.set(summary.filename, {
+            filename: summary.filename,
+            chars: typeof summary.chars === "number" ? summary.chars : 0,
+            preview: summary.preview || "",
+          });
+        }
+        const eventCitations = Array.isArray(event.citations) ? event.citations : [];
+        for (const citation of eventCitations) {
+          if (!citation?.filename || !citation?.quote) continue;
+          const key = `${citation.filename}:${citation.quote}`;
+          if (citationKeySet.has(key)) continue;
+          citationKeySet.add(key);
+          citations.push({
+            filename: citation.filename,
+            quote: citation.quote,
+            why: citation.why,
+            line_start: citation.line_start,
+            line_end: citation.line_end,
+          });
+        }
+        const gaps = Array.isArray(event.evidence_gaps) ? event.evidence_gaps : [];
+        for (const gap of gaps) {
+          if (typeof gap === "string" && gap.trim()) evidenceGapSet.add(gap.trim());
+        }
+        const toolCalls = Array.isArray(event.tool_calls) ? event.tool_calls : [];
+        for (const call of toolCalls) {
+          if (!call?.tool_name || !call?.source) continue;
+          toolCallList.push({
+            tool_name: call.tool_name,
+            source: call.source,
+            file: call.file,
+            status: call.status,
+            bytes_read: call.bytes_read,
+            timestamp: call.timestamp,
+          });
+        }
+        if (typeof event.context_file_count === "number") {
+          contextFileCount += event.context_file_count;
+        }
+      }
+      const lastEvent = llmEvents[llmEvents.length - 1];
+      const trace: CommandRunTrace = {
+        trace_id: lastEvent?.trace_id,
+        created_at: new Date().toISOString(),
+        model: lastEvent?.model || model || "auto",
+        provider: lastEvent?.provider,
+        answer_preview: (parsedOutput.answer || rawOutput).slice(0, 180),
+        reasoning: parsedOutput.reasoning || undefined,
+        reasoning_summary: lastEvent?.reasoning_summary || undefined,
+        context_files: Array.from(contextFileSet),
+        context_file_count: contextFileCount || contextFileSet.size,
+        context_file_summaries: Array.from(contextSummaryByFile.values()),
+        citations,
+        evidence_gaps: Array.from(evidenceGapSet),
+        tool_calls: toolCallList,
+      };
+      updateProject(selectedProject.id, {
+        lastCommandTrace: trace,
+      });
 
       const promptSummary =
         cleanPrompt.length > 96 ? `${cleanPrompt.slice(0, 96)}...` : cleanPrompt;
@@ -636,6 +1207,7 @@ export default function Home() {
     openEscalation,
     resolveEscalation,
     selectedProject,
+    updateProject,
   ]);
 
   const getProfileContext = useCallback(() => {
@@ -691,18 +1263,6 @@ export default function Home() {
     [addLlmTelemetryEvent]
   );
 
-  const refreshRolloutHistory = useCallback(
-    async (projectId: string) => {
-      try {
-        const history = await getProjectRolloutHistory(projectId);
-        updateProject(projectId, { rolloutHistory: history.events });
-      } catch (err) {
-        console.warn("Failed to fetch rollout history", err);
-      }
-    },
-    [updateProject]
-  );
-
   const hydrateProjectCrew = useCallback(
     async (projectId: string) => {
       try {
@@ -736,11 +1296,6 @@ export default function Home() {
 
   useEffect(() => {
     if (!selectedProject?.id) return;
-    void refreshRolloutHistory(selectedProject.id);
-  }, [selectedProject?.id, refreshRolloutHistory]);
-
-  useEffect(() => {
-    if (!selectedProject?.id) return;
     const projectId = selectedProject.id;
     const doerCount = selectedProject.doers?.length || 0;
     const reviewerCount = selectedProject.reviewers?.length || 0;
@@ -761,43 +1316,6 @@ export default function Home() {
     selectedProject?.doers?.length,
     selectedProject?.id,
     selectedProject?.reviewers?.length,
-  ]);
-
-  useEffect(() => {
-    if (!selectedProject?.id || !selectedProject.rolloutHistory?.length) return;
-    const latestEvent =
-      selectedProject.rolloutHistory[selectedProject.rolloutHistory.length - 1];
-    if (latestEvent.source !== "auto_fallback") return;
-    if (fallbackAlertRef.current[selectedProject.id] === latestEvent.updated_at) return;
-    fallbackAlertRef.current[selectedProject.id] = latestEvent.updated_at;
-    notify.warning(
-      "Rollout Auto-Fallback",
-      "Reviewer pipeline switched to shadow mode after an active-path failure."
-    );
-    openEscalation(selectedProject.id, {
-      level: "L2",
-      trigger: "auto_fallback",
-      reason: "Candidate reviewer path failed and auto-fallback was triggered.",
-      recommended_action: "Inspect fallback event, then approve recovery to active mode when safe.",
-      status: "open",
-      created_at: new Date().toISOString(),
-    });
-    appendProjectDecision(selectedProject.id, {
-      actor_type: "system",
-      actor_id: "rollout_guard",
-      decision_type: "fallback",
-      reason: latestEvent.reason || "automatic fallback",
-      impact_summary: "Rollout mode moved away from active due to candidate quality failure.",
-      metadata: {
-        mode: latestEvent.mode,
-        from_mode: latestEvent.from_mode,
-      },
-    });
-  }, [
-    appendProjectDecision,
-    openEscalation,
-    selectedProject?.id,
-    selectedProject?.rolloutHistory,
   ]);
 
   // --- Review handlers ---
@@ -868,6 +1386,16 @@ export default function Home() {
         }
       );
       setReviewResults(results, summary, conflicts);
+      const generatedThreads = buildCommentThreadsFromResults(
+        selectedProject.id,
+        results,
+        editor
+      );
+      updateProject(selectedProject.id, {
+        commentThreads: generatedThreads,
+        activeThreadId: null,
+      });
+      setThreadBubbleRect(null);
       pushLlmMetaEvents(llmMeta);
       appendProjectDecision(selectedProject.id, {
         actor_type: "reviewer",
@@ -915,6 +1443,8 @@ export default function Home() {
     } catch (err) {
       console.error("Review failed:", err);
       clearReview();
+      updateProject(selectedProject.id, { commentThreads: [], activeThreadId: null });
+      setThreadBubbleRect(null);
       notify.error("Review Failed", err instanceof Error ? err.message : "Is the backend running?");
       openEscalation(selectedProject.id, {
         level: "L1",
@@ -924,8 +1454,6 @@ export default function Home() {
         status: "open",
         created_at: new Date().toISOString(),
       });
-    } finally {
-      void refreshRolloutHistory(selectedProject.id);
     }
   }, [
     appendProjectDecision,
@@ -939,7 +1467,7 @@ export default function Home() {
     addHubEvent,
     getProfileContext,
     pushLlmMetaEvents,
-    refreshRolloutHistory,
+    updateProject,
   ]);
 
   const handleRunSingleReview = useCallback(
@@ -1003,6 +1531,20 @@ export default function Home() {
         if (results.length > 0) {
           updateSingleResult(results[0]);
           const r = results[0];
+          const mergedResults = [
+            ...review.results.filter((result) => result.judgeId !== r.judgeId),
+            r,
+          ];
+          const generatedThreads = buildCommentThreadsFromResults(
+            selectedProject.id,
+            mergedResults,
+            editor
+          );
+          updateProject(selectedProject.id, {
+            commentThreads: generatedThreads,
+            activeThreadId: null,
+          });
+          setThreadBubbleRect(null);
           notify.info(
             `${r.judgeName}`,
             `Score: ${r.score.toFixed(1)}/10 — ${r.annotations.length} annotations`
@@ -1028,11 +1570,10 @@ export default function Home() {
         console.error("Single reviewer run failed:", err);
         setRunningJudgeId(null);
         notify.error("Review Failed", err instanceof Error ? err.message : "Is the backend running?");
-      } finally {
-        void refreshRolloutHistory(selectedProject.id);
       }
     },
     [
+      review.results,
       selectedProject,
       setRunningJudgeId,
       updateSingleResult,
@@ -1040,209 +1581,39 @@ export default function Home() {
       appendProjectDecision,
       getProfileContext,
       pushLlmMetaEvents,
-      refreshRolloutHistory,
       setProjectCapacity,
-    ]
-  );
-
-  const handleRunShadowReview = useCallback(async () => {
-    const editor = editorRef.current;
-    if (!editor || !selectedProject) return;
-
-    const judgeIds = selectedProject.reviewers
-      ?.filter((r) => r.enabled)
-      .map((r) => r.id) ?? ["brand_consistency", "legal_compliance"];
-    const baselineReviewerContext = selectedProject.reviewers?.map((reviewer) => ({
-      id: reviewer.id,
-      name: reviewer.name,
-      description: reviewer.description ?? reviewer.reason,
-      system_prompt: reviewer.system_prompt,
-      strictness: reviewer.strictness,
-      rubric: reviewer.rubric,
-    }));
-    const candidateReviewerContext = selectedProject.reviewers?.map((reviewer) => ({
-      id: reviewer.id,
-      name: reviewer.name,
-      description: reviewer.description ?? reviewer.reason,
-      system_prompt: reviewer.system_prompt
-        ? `${reviewer.system_prompt}\n\nAdditional candidate instruction: prioritize strict source-backed critique and higher issue sensitivity.`
-        : "Apply stricter source-backed critique with higher issue sensitivity.",
-      strictness: promoteStrictness(reviewer.strictness),
-      rubric: reviewer.rubric,
-    }));
-
-    updateProject(selectedProject.id, {
-      shadowReview: {
-        status: "running",
-      },
-    });
-
-    try {
-      const response = await reviewDocumentShadow({
-        document_text: editor.getText(),
-        judge_ids: judgeIds,
-        project_id: selectedProject.id,
-        profile_context: getProfileContext(),
-        reviewer_context: baselineReviewerContext,
-        candidate_judge_ids: judgeIds,
-        candidate_reviewer_context: candidateReviewerContext,
-      });
-      pushLlmMetaEvents(response.baseline.llm_meta || []);
-      pushLlmMetaEvents(response.candidate.llm_meta || []);
-
-      updateProject(selectedProject.id, {
-        shadowReview: {
-          status: "done",
-          last_run_at: new Date().toISOString(),
-          pair_count: response.comparison.pair_count,
-          decision_agreement_rate: response.comparison.decision_agreement_rate,
-          precision_proxy: response.comparison.precision_proxy,
-          recall_proxy: response.comparison.recall_proxy,
-          mean_score_delta: response.comparison.mean_score_delta,
-        },
-      });
-      notify.info(
-        "Shadow Review Complete",
-        `Agreement ${Math.round(response.comparison.decision_agreement_rate * 100)}% across ${response.comparison.pair_count} reviewer pairs`
-      );
-      appendProjectDecision(selectedProject.id, {
-        actor_type: "reviewer",
-        actor_id: "concordia_shadow",
-        decision_type: "review_cycle",
-        reason: "Completed shadow concordia comparison.",
-        impact_summary: `Agreement ${Math.round(
-          response.comparison.decision_agreement_rate * 100
-        )}% with mean score delta ${response.comparison.mean_score_delta.toFixed(2)}.`,
-      });
-    } catch (err) {
-      updateProject(selectedProject.id, {
-        shadowReview: {
-          status: "error",
-          error: err instanceof Error ? err.message : "Shadow review failed",
-        },
-      });
-      notify.error(
-        "Shadow Review Failed",
-        err instanceof Error ? err.message : "Is the backend running?"
-      );
-      openEscalation(selectedProject.id, {
-        level: "L1",
-        trigger: "retry_exhausted",
-        reason: "Shadow concordia run failed.",
-        recommended_action: "Retry shadow run or keep baseline reviewers active.",
-        status: "open",
-        created_at: new Date().toISOString(),
-      });
-    }
-  }, [
-    appendProjectDecision,
-    getProfileContext,
-    openEscalation,
-    pushLlmMetaEvents,
-    selectedProject,
-    updateProject,
-  ]);
-
-  const handleSetRolloutMode = useCallback(
-    async (mode: "baseline" | "shadow" | "active") => {
-      if (!selectedProject) return;
-      const previous = selectedProject.rolloutMode || "baseline";
-
-      updateProject(selectedProject.id, { rolloutMode: mode });
-      try {
-        await setProjectRolloutMode(
-          selectedProject.id,
-          mode,
-          mode === "baseline" ? "manual rollback" : "controlled launch update"
-        );
-        await refreshRolloutHistory(selectedProject.id);
-        notify.success("Rollout Mode Updated", `Project now running in ${mode} mode.`);
-        appendProjectDecision(selectedProject.id, {
-          actor_type: "human",
-          actor_id: "current_user",
-          decision_type: "route_change",
-          reason: `Rollout mode switched from ${previous} to ${mode}.`,
-          impact_summary: `Reviewer routing now uses ${mode} strategy.`,
-          metadata: { previous, next: mode },
-        });
-        if (mode === "active" && selectedProject.escalation?.status === "open") {
-          resolveEscalation(selectedProject.id, "Rollout manually set to active.");
-        }
-      } catch (err) {
-        updateProject(selectedProject.id, { rolloutMode: previous });
-        notify.error(
-          "Rollout Update Failed",
-          err instanceof Error ? err.message : "Could not update rollout mode"
-        );
-      }
-    },
-    [
-      appendProjectDecision,
-      refreshRolloutHistory,
-      resolveEscalation,
-      selectedProject,
       updateProject,
     ]
   );
 
-  const handleRecoverToActive = useCallback(async () => {
-    if (!selectedProject) return;
-    const previous = selectedProject.rolloutMode || "baseline";
-    setIsRecoveringToActive(true);
-    updateProject(selectedProject.id, { rolloutMode: "active" });
-    try {
-      await setProjectRolloutMode(
-        selectedProject.id,
-        "active",
-        "guided recovery after fallback"
-      );
-      await refreshRolloutHistory(selectedProject.id);
-      notify.success(
-        "Recovery Complete",
-        "Project returned to active rollout mode. Monitor next review runs closely."
-      );
-      appendProjectDecision(selectedProject.id, {
-        actor_type: "human",
-        actor_id: "current_user",
-        decision_type: "override",
-        reason: "Manual recovery to active rollout mode.",
-        impact_summary: "Project moved back to active mode after fallback.",
-      });
-      if (selectedProject.escalation?.status === "open") {
-        resolveEscalation(selectedProject.id, "Recovery to active mode completed.");
-      }
-    } catch (err) {
-      updateProject(selectedProject.id, { rolloutMode: previous });
-      notify.error(
-        "Recovery Failed",
-        err instanceof Error ? err.message : "Could not recover to active mode"
-      );
-    } finally {
-      setIsRecoveringToActive(false);
-    }
-  }, [appendProjectDecision, refreshRolloutHistory, resolveEscalation, selectedProject, updateProject]);
-
   const handleAnnotationClick = useCallback(
     (annotationId: string) => {
       const editor = editorRef.current;
-      if (!editor) return;
+      if (!selectedProject) return;
 
       // Find the annotation
       const ann = review.results
         .flatMap((r) => r.annotations)
         .find((a) => a.id === annotationId);
+      const linkedThread = (selectedProject.commentThreads || []).find(
+        (thread) => thread.annotation_id === annotationId && thread.status === "open"
+      );
+      const focusPos = ann?.startPos ?? linkedThread?.anchor.startPos;
 
-      if (ann?.startPos != null) {
+      if (focusPos != null && editor) {
         // Scroll editor to annotation
         editor.commands.focus();
-        editor.commands.setTextSelection(ann.startPos);
+        editor.commands.setTextSelection(focusPos);
 
         // Highlight for 2 seconds
         setActiveAnnotation(annotationId);
         setTimeout(() => setActiveAnnotation(null), 2000);
       }
+      if (linkedThread) {
+        selectThread(linkedThread.id);
+      }
     },
-    [review.results, setActiveAnnotation]
+    [review.results, selectedProject, selectThread, setActiveAnnotation]
   );
 
   const handleAnnotationHover = useCallback(
@@ -1255,6 +1626,15 @@ export default function Home() {
     },
     []
   );
+
+  const handleClearReview = useCallback(() => {
+    clearReview();
+    if (selectedProject) {
+      updateProject(selectedProject.id, { commentThreads: [], activeThreadId: null });
+    }
+    setThreadBubbleRect(null);
+    setTooltip(null);
+  }, [clearReview, selectedProject, updateProject]);
 
   // Build flat annotation array for the editor (only visible judges)
   const editorAnnotations: AnnotationWithColor[] = useMemo(() => {
@@ -1279,6 +1659,27 @@ export default function Home() {
     }
     return null;
   }, [tooltip, review.results]);
+
+  const activeThreadId = selectedProject?.activeThreadId ?? null;
+  const activeThread = useMemo(() => {
+    if (!selectedProject || !activeThreadId) return null;
+    return (selectedProject.commentThreads ?? []).find((thread) => thread.id === activeThreadId) ?? null;
+  }, [selectedProject, activeThreadId]);
+
+  const handleThreadClick = useCallback(
+    (threadId: string, rect?: DOMRect) => {
+      selectThread(threadId, rect);
+    },
+    [selectThread]
+  );
+
+  const handleThreadHover = useCallback(
+    (threadId: string | null, rect?: DOMRect) => {
+      if (!threadId || !rect || threadId !== activeThreadId) return;
+      setThreadBubbleRect(rect);
+    },
+    [activeThreadId]
+  );
 
   const syncStatus = selectedProject?.syncStatus || "idle";
   const connector = selectedProject?.connector || null;
@@ -1336,9 +1737,13 @@ export default function Home() {
               onCmdK={focusCommandInput}
               disabled={false}
               annotations={editorAnnotations}
+              commentThreads={selectedProject.commentThreads || []}
               activeAnnotationId={review.activeAnnotationId}
+              activeThreadId={selectedProject.activeThreadId || null}
               onAnnotationClick={handleAnnotationClick}
               onAnnotationHover={handleAnnotationHover}
+              onThreadClick={handleThreadClick}
+              onThreadHover={handleThreadHover}
               editorRef={handleEditorRef}
             />
           )}
@@ -1374,22 +1779,22 @@ export default function Home() {
             activeAnnotationId={review.activeAnnotationId}
             visibleJudgeIds={review.visibleJudgeIds}
             onRunReview={handleRunReview}
-            onClearReview={clearReview}
+            onClearReview={handleClearReview}
           onRunSingleReview={handleRunSingleReview}
           runningJudgeId={review.runningJudgeId}
           onAnnotationClick={handleAnnotationClick}
           onToggleJudgeVisibility={toggleJudgeVisibility}
-          shadowReview={selectedProject?.shadowReview}
-          onRunShadowReview={handleRunShadowReview}
-          rolloutMode={selectedProject?.rolloutMode || "baseline"}
-          rolloutHistory={selectedProject?.rolloutHistory}
-          onOpenRolloutHistory={() => setShowRolloutHistory(true)}
-          onRecoverToActive={handleRecoverToActive}
-          isRecoveringToActive={isRecoveringToActive}
-          onSetRolloutMode={handleSetRolloutMode}
           decisionLog={selectedProject?.decisionLog || []}
           escalation={selectedProject?.escalation || null}
           capacity={selectedProject?.capacity || null}
+          lastCommandTrace={selectedProject?.lastCommandTrace || null}
+          commentThreads={selectedProject?.commentThreads || []}
+          activeThreadId={selectedProject?.activeThreadId || null}
+          onSelectThread={selectThread}
+          onAcceptThreadSuggestion={handleAcceptThreadSuggestion}
+          onRejectThreadSuggestion={handleRejectThreadSuggestion}
+          onRevertThreadSuggestion={handleRevertThreadSuggestion}
+          onResolveThread={handleResolveThread}
         />
       )}
       </div>
@@ -1415,18 +1820,15 @@ export default function Home() {
         />
       )}
 
-      {/* Rollout history and guided recovery */}
-      {selectedProject && (
-        <RolloutHistoryModal
-          isOpen={showRolloutHistory}
-          onClose={() => setShowRolloutHistory(false)}
-          projectName={selectedProject.name}
-          currentMode={selectedProject.rolloutMode || "baseline"}
-          events={selectedProject.rolloutHistory || []}
-          onRecoverToActive={handleRecoverToActive}
-          isRecovering={isRecoveringToActive}
-        />
-      )}
+      <ThreadBubble
+        thread={activeThread}
+        rect={threadBubbleRect}
+        onClose={closeActiveThread}
+        onAccept={handleAcceptThreadSuggestion}
+        onReject={handleRejectThreadSuggestion}
+        onRevert={handleRevertThreadSuggestion}
+        onResolve={handleResolveThread}
+      />
 
       {/* Annotation tooltip */}
       {tooltipData && tooltip && (

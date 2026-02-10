@@ -21,6 +21,27 @@ export interface AnnotationWithColor extends ReviewAnnotation {
 
 export const reviewAnnotationsPluginKey = new PluginKey("reviewAnnotations");
 
+function colorWithAlpha(color: string, alpha: number): string {
+  const safeAlpha = Math.max(0, Math.min(1, alpha));
+  const hex = color.trim();
+  if (hex.startsWith("#")) {
+    const raw = hex.slice(1);
+    if (raw.length === 3) {
+      const r = parseInt(raw[0] + raw[0], 16);
+      const g = parseInt(raw[1] + raw[1], 16);
+      const b = parseInt(raw[2] + raw[2], 16);
+      return `rgba(${r}, ${g}, ${b}, ${safeAlpha})`;
+    }
+    if (raw.length === 6) {
+      const r = parseInt(raw.slice(0, 2), 16);
+      const g = parseInt(raw.slice(2, 4), 16);
+      const b = parseInt(raw.slice(4, 6), 16);
+      return `rgba(${r}, ${g}, ${b}, ${safeAlpha})`;
+    }
+  }
+  return color;
+}
+
 export interface ReviewAnnotationsStorage {
   annotationsRef: { current: AnnotationWithColor[] };
   activeIdRef: { current: string | null };
@@ -99,6 +120,8 @@ export const ReviewAnnotationsExtension = Extension.create<
 
               const thickness =
                 annotation.severity === "critical" ? "2.5px" : "2px";
+              const overlayColor = colorWithAlpha(annotation.color.underline, 0.2);
+              const activeOverlayColor = colorWithAlpha(annotation.color.underline, 0.28);
 
               // Inline decoration: colored underline
               decorations.push(
@@ -108,9 +131,7 @@ export const ReviewAnnotationsExtension = Extension.create<
                     `text-decoration: ${textDecoStyle}`,
                     `text-decoration-thickness: ${thickness}`,
                     `text-underline-offset: 3px`,
-                    isActive
-                      ? `background-color: ${annotation.color.bg}`
-                      : "",
+                    `background-color: ${isActive ? activeOverlayColor : overlayColor}`,
                   ]
                     .filter(Boolean)
                     .join("; "),
@@ -138,7 +159,7 @@ export const ReviewAnnotationsExtension = Extension.create<
                   "font-size: 11px",
                   "font-weight: 700",
                   "border-radius: 50%",
-                  `background: ${annotation.color.bg}`,
+                  `background: ${overlayColor}`,
                   `border: 1.5px solid ${annotation.color.underline}`,
                   "margin-right: 2px",
                   "cursor: pointer",

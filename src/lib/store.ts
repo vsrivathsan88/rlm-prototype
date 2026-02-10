@@ -49,6 +49,51 @@ export type ReviewAnnotation = {
   criterion?: string;
 };
 
+export type ThreadSuggestionStatus = "pending" | "accepted" | "rejected" | "reverted";
+
+export type ThreadSuggestion = {
+  id: string;
+  kind: "replace_range";
+  status: ThreadSuggestionStatus;
+  from: number;
+  to: number;
+  original_text: string;
+  replacement_text: string;
+  applied_from?: number;
+  applied_to?: number;
+  applied_at?: string;
+};
+
+export type ThreadMessage = {
+  id: string;
+  author_type: "human" | "reviewer" | "system";
+  author_name: string;
+  body: string;
+  created_at: string;
+};
+
+export type CommentThread = {
+  id: string;
+  key: string;
+  project_id: string;
+  annotation_id?: string;
+  judge_id?: string;
+  judge_name?: string;
+  severity: AnnotationSeverity;
+  status: "open" | "resolved";
+  anchor: {
+    startPos: number;
+    endPos: number;
+    startLine: number;
+    endLine: number;
+  };
+  color: ReviewerColor;
+  messages: ThreadMessage[];
+  suggestion?: ThreadSuggestion;
+  created_at: string;
+  updated_at: string;
+};
+
 export type ReviewResultFE = {
   judgeId: string;
   judgeName: string;
@@ -164,15 +209,37 @@ export type QuickAction = {
   icon: string;
 };
 
-export type ShadowReviewSnapshot = {
-  status: "idle" | "running" | "done" | "error";
-  last_run_at?: string;
-  decision_agreement_rate?: number;
-  precision_proxy?: number;
-  recall_proxy?: number;
-  mean_score_delta?: number;
-  pair_count?: number;
-  error?: string;
+export type CommandRunTrace = {
+  trace_id?: string;
+  created_at: string;
+  model: string;
+  provider?: string;
+  answer_preview: string;
+  reasoning?: string;
+  reasoning_summary?: string;
+  context_files: string[];
+  context_file_count: number;
+  context_file_summaries?: Array<{
+    filename: string;
+    chars: number;
+    preview: string;
+  }>;
+  citations?: Array<{
+    filename: string;
+    quote: string;
+    why?: string;
+    line_start?: number | null;
+    line_end?: number | null;
+  }>;
+  evidence_gaps?: string[];
+  tool_calls?: Array<{
+    tool_name: string;
+    source: string;
+    file?: string | null;
+    status?: string;
+    bytes_read?: number | null;
+    timestamp?: string | null;
+  }>;
 };
 
 export type KeyResult = {
@@ -193,8 +260,10 @@ export type Project = DomainProject & {
   files?: TreeNode[];
   documents?: Document[];
   quick_actions?: QuickAction[];
-  shadowReview?: ShadowReviewSnapshot;
   rolloutHistory?: RolloutHistoryEvent[];
+  lastCommandTrace?: CommandRunTrace | null;
+  commentThreads?: CommentThread[];
+  activeThreadId?: string | null;
   decisionLog?: DecisionLogEvent[];
   escalation?: EscalationState | null;
   capacity?: CapacityState;
@@ -376,6 +445,9 @@ export const useAppStore = create<Store>()(
           files: [],
           syncStatus: "idle",
           rolloutMode: "active",
+          lastCommandTrace: null,
+          commentThreads: [],
+          activeThreadId: null,
           decisionLog: [],
           escalation: null,
           capacity: { ...defaultCapacityState },
@@ -398,6 +470,9 @@ export const useAppStore = create<Store>()(
             ...state.projects,
             {
               ...project,
+              lastCommandTrace: project.lastCommandTrace ?? null,
+              commentThreads: project.commentThreads ?? [],
+              activeThreadId: project.activeThreadId ?? null,
               decisionLog: project.decisionLog ?? [],
               escalation: project.escalation ?? null,
               capacity: project.capacity ?? { ...defaultCapacityState },

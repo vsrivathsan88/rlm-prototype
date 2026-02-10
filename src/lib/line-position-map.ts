@@ -1,9 +1,10 @@
 /**
  * Maps line numbers (from backend annotations) to ProseMirror document positions.
  *
- * The backend LLM sees the document as plain text where each paragraph/heading
- * is a separate "line." This utility walks the ProseMirror document tree and
- * assigns sequential 1-based line numbers to top-level block nodes.
+ * The backend LLM sees the document as plain text where each text block
+ * (paragraph, heading, list item paragraph) is a separate "line."
+ * This utility walks the ProseMirror document tree and maps those lines
+ * to concrete ProseMirror positions.
  */
 
 import type { Node as ProseMirrorNode } from "@tiptap/pm/model";
@@ -16,27 +17,35 @@ export interface LineRange {
 
 /**
  * Build a mapping from 1-based line numbers to ProseMirror positions.
- * Each top-level block node (paragraph, heading, list, etc.) = one "line."
+ * Each textblock node (including nested list items) = one "line."
  */
 export function buildLineMap(doc: ProseMirrorNode): LineRange[] {
   const lines: LineRange[] = [];
   let lineNumber = 1;
 
-  doc.forEach((node, offset) => {
-    // offset is relative to doc content start
-    // Absolute position: offset + 1 (doc node itself takes position 0)
-    const from = offset + 1;
-    // nodeSize includes opening + closing tokens, so content ends at from + nodeSize - 2
-    const to = from + node.nodeSize - 2;
+  doc.descendants((node, pos) => {
+    if (!node.isTextblock) return true;
+
+    // For textblocks, content starts at pos + 1 and spans node.content.size.
+    const from = pos + 1;
+    const to = Math.max(from, pos + Math.max(1, node.content.size));
 
     lines.push({
       line: lineNumber,
       from,
-      to: Math.max(from, to),
+      to,
     });
-
-    lineNumber++;
+    lineNumber += 1;
+    return true;
   });
+
+  if (!lines.length) {
+    lines.push({
+      line: 1,
+      from: 1,
+      to: Math.max(1, doc.content.size),
+    });
+  }
 
   return lines;
 }

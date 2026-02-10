@@ -3,7 +3,9 @@ import { expect, test } from "@playwright/test";
 test("onboarding team questions reveal progressively and adaptive questions render", async ({
   page,
 }) => {
+  let adaptiveRequestPayload: Record<string, unknown> | null = null;
   await page.route("**/v1/onboarding/adaptive-questions", async (route) => {
+    adaptiveRequestPayload = route.request().postDataJSON() as Record<string, unknown>;
     await route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -32,8 +34,13 @@ test("onboarding team questions reveal progressively and adaptive questions rend
 
   await page.goto("/onboarding");
 
-  await expect(page.getByRole("heading", { name: "What's your job function?" })).toBeVisible();
-  await page.getByTestId("role-card-product_marketing_manager").click({ force: true });
+  await expect(
+    page.getByRole("heading", { name: "Build your first agentic workspace in 2 minutes" })
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Start Setup" }).click();
+
+  await expect(page.getByRole("heading", { name: "What's your title?" })).toBeVisible();
+  await page.getByTestId("title-input").fill("Founder");
   await expect(page.getByRole("button", { name: "Continue" })).toBeEnabled();
   await page.getByRole("button", { name: "Continue" }).click();
 
@@ -56,4 +63,11 @@ test("onboarding team questions reveal progressively and adaptive questions rend
 
   await expect(page.getByRole("heading", { name: "What are your top priorities?" })).toBeVisible();
   await expect(page.getByPlaceholder("e.g. Increase qualified pipeline")).toBeVisible();
+  expect(adaptiveRequestPayload).toMatchObject({
+    job_title: "Founder",
+    team_size: "small",
+    reporting_level: "manager",
+    industry: "saas",
+    company_stage: "growth",
+  });
 });

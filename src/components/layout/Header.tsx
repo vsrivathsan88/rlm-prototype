@@ -1,5 +1,6 @@
 "use client";
 
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { StatusIndicator } from "@/components/ui/StatusIndicator";
 import { Button } from "@/components/ui/Button";
@@ -11,12 +12,72 @@ interface HeaderProps {
   onToggleFocusMode?: () => void;
 }
 
+const ADMIN_UNLOCK_FLAG = "rlm_admin_unlocked";
+const KONAMI_SEQUENCE = [
+  "arrowup",
+  "arrowup",
+  "arrowdown",
+  "arrowdown",
+  "arrowleft",
+  "arrowright",
+  "arrowleft",
+  "arrowright",
+  "b",
+  "a",
+];
+
 export function Header({
   projectName,
   syncStatus = "idle",
   focusMode = false,
   onToggleFocusMode,
 }: HeaderProps) {
+  const [adminUnlocked, setAdminUnlocked] = useState(() => {
+    if (typeof window === "undefined") return false;
+    return window.sessionStorage.getItem(ADMIN_UNLOCK_FLAG) === "1";
+  });
+  const [konamiProgress, setKonamiProgress] = useState(0);
+
+  useEffect(() => {
+    if (adminUnlocked || typeof window === "undefined") return;
+
+    const handleKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tagName = target?.tagName?.toLowerCase() || "";
+      const isTypingSurface =
+        tagName === "input" ||
+        tagName === "textarea" ||
+        (target?.getAttribute("contenteditable") ?? "false") === "true";
+      if (isTypingSurface) return;
+
+      const key = event.key.toLowerCase();
+      const expected = KONAMI_SEQUENCE[konamiProgress];
+      if (key === expected) {
+        const next = konamiProgress + 1;
+        if (next >= KONAMI_SEQUENCE.length) {
+          setAdminUnlocked(true);
+          setKonamiProgress(0);
+          window.sessionStorage.setItem(ADMIN_UNLOCK_FLAG, "1");
+          return;
+        }
+        setKonamiProgress(next);
+        return;
+      }
+      setKonamiProgress(key === KONAMI_SEQUENCE[0] ? 1 : 0);
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [adminUnlocked, konamiProgress]);
+
+  const lockAdminMode = () => {
+    setAdminUnlocked(false);
+    setKonamiProgress(0);
+    if (typeof window !== "undefined") {
+      window.sessionStorage.removeItem(ADMIN_UNLOCK_FLAG);
+    }
+  };
+
   return (
     <header className="flex items-center justify-between border-b border-[var(--deck-edge)] bg-[var(--deck-frost)] px-6 py-4 shadow-[var(--shadow-sm)] backdrop-blur-md">
       <div className="flex items-center gap-6">
@@ -75,6 +136,26 @@ export function Header({
             Settings
           </Button>
         </Link>
+        {adminUnlocked && (
+          <>
+            <Link href="/admin/control">
+              <Button variant="ghost" size="sm">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M4 7h16M4 12h16M4 17h16" />
+                </svg>
+                Ops
+              </Button>
+            </Link>
+            <button
+              type="button"
+              onClick={lockAdminMode}
+              className="rounded border border-[var(--deck-edge)] px-2 py-1 text-[10px] text-[var(--ash)] hover:text-[var(--pearl)]"
+              title="Lock admin shortcuts"
+            >
+              Lock
+            </button>
+          </>
+        )}
       </nav>
     </header>
   );

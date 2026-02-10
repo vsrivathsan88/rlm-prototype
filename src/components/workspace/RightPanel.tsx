@@ -2,28 +2,23 @@
 
 import { useState } from "react";
 import { Panel, PanelHeader } from "@/components/ui/Panel";
-import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { StatusIndicator } from "@/components/ui/StatusIndicator";
-import { ReviewerCard } from "@/components/workspace/ReviewerCard";
 import type {
+  CommandRunTrace,
   CapacityState,
+  CommentThread,
   DecisionLogEvent,
   Doer,
   EscalationState,
   Reviewer,
   ReviewResultFE,
   ReviewSummaryFE,
-  RolloutHistoryEvent,
-  ShadowReviewSnapshot,
 } from "@/lib/store";
-import { connectorLabel } from "@/lib/connectors";
 
 interface RightPanelProps {
   syncStatus: "idle" | "syncing" | "done";
   connector: string | null;
   filesCount?: number;
-  // Review props
   isReviewing?: boolean;
   reviewResults?: ReviewResultFE[];
   reviewSummary?: ReviewSummaryFE | null;
@@ -35,23 +30,23 @@ interface RightPanelProps {
   runningJudgeId?: string | null;
   onAnnotationClick?: (annotationId: string) => void;
   onToggleJudgeVisibility?: (judgeId: string) => void;
-  shadowReview?: ShadowReviewSnapshot;
-  onRunShadowReview?: () => void;
-  rolloutMode?: "baseline" | "shadow" | "active";
-  rolloutHistory?: RolloutHistoryEvent[];
-  onOpenRolloutHistory?: () => void;
-  onRecoverToActive?: () => void;
-  isRecoveringToActive?: boolean;
-  onSetRolloutMode?: (mode: "baseline" | "shadow" | "active") => void;
   decisionLog?: DecisionLogEvent[];
   escalation?: EscalationState | null;
   capacity?: CapacityState | null;
+  lastCommandTrace?: CommandRunTrace | null;
+  commentThreads?: CommentThread[];
+  activeThreadId?: string | null;
+  onSelectThread?: (threadId: string) => void;
+  onAcceptThreadSuggestion?: (threadId: string) => void;
+  onRejectThreadSuggestion?: (threadId: string) => void;
+  onRevertThreadSuggestion?: (threadId: string) => void;
+  onResolveThread?: (threadId: string) => void;
   crewDoers?: Doer[];
   crewReviewers?: Reviewer[];
 }
 
-function formatRolloutTime(value?: string): string {
-  if (!value) return "unknown time";
+function formatTime(value?: string): string {
+  if (!value) return "unknown";
   const timestamp = Date.parse(value);
   if (Number.isNaN(timestamp)) return value;
   return new Date(timestamp).toLocaleString([], {
@@ -60,25 +55,6 @@ function formatRolloutTime(value?: string): string {
     hour: "2-digit",
     minute: "2-digit",
   });
-}
-
-function rolloutSourceLabel(source: RolloutHistoryEvent["source"]): string {
-  if (source === "auto_fallback") return "auto fallback";
-  if (source === "manual") return "manual change";
-  if (source === "migration") return "legacy migration";
-  if (source === "hydrate") return "state hydration";
-  return "project init";
-}
-
-function decisionTypeLabel(type: DecisionLogEvent["decision_type"]): string {
-  if (type === "review_cycle") return "review";
-  if (type === "escalation_opened") return "escalated";
-  if (type === "escalation_resolved") return "resolved";
-  if (type === "capacity_queue") return "queued";
-  if (type === "capacity_override") return "override";
-  if (type === "route_change") return "route";
-  if (type === "fallback") return "fallback";
-  return type.replaceAll("_", " ");
 }
 
 function deterministicEmoji(seed: string, pool: string[]): string {
@@ -90,14 +66,14 @@ function deterministicEmoji(seed: string, pool: string[]): string {
   return pool[hash % pool.length];
 }
 
-function crewEmoji(id: string, name: string, kind: "doer" | "reviewer"): string {
+function memberEmoji(id: string, name: string, kind: "doer" | "reviewer"): string {
   if (kind === "doer") {
     return deterministicEmoji(`${id}:${name}`, ["🧭", "🛠️", "🚀", "🧠", "📐", "⚙️"]);
   }
   return deterministicEmoji(`${id}:${name}`, ["🔍", "🧪", "🛡️", "📏", "🧾", "🧠"]);
 }
 
-function summarizeCrewRole(
+function memberSubtitle(
   member: Pick<Doer, "specialty" | "description"> | Pick<Reviewer, "reason" | "description">,
   kind: "doer" | "reviewer"
 ): string {
@@ -109,55 +85,7 @@ function summarizeCrewRole(
   return reviewer.reason || reviewer.description || "Reviews output quality";
 }
 
-function deriveSourceConfidence(reviewResults: ReviewResultFE[]): "High" | "Medium" | "Low" {
-  if (reviewResults.length === 0) return "Medium";
-  let criticalCount = 0;
-  for (const result of reviewResults) {
-    criticalCount += result.annotations.filter((annotation) => annotation.severity === "critical").length;
-  }
-  if (criticalCount >= 3) return "Low";
-  if (criticalCount >= 1) return "Medium";
-  return "High";
-}
-
-function countEvidenceWarnings(reviewResults: ReviewResultFE[]): number {
-  const pattern = /(unsupported|source|evidence|citation|unverified)/i;
-  let count = 0;
-  for (const result of reviewResults) {
-    for (const annotation of result.annotations) {
-      if (pattern.test(annotation.message)) count += 1;
-    }
-  }
-  return count;
-}
-
-function concordiaHealthLabel(shadowReview?: ShadowReviewSnapshot): {
-  label: string;
-  tone: "neutral" | "good" | "warn";
-} {
-  if (!shadowReview || shadowReview.status === "idle") {
-    return { label: "Not run yet", tone: "neutral" };
-  }
-  if (shadowReview.status === "running") {
-    return { label: "Comparing reviewer variants", tone: "neutral" };
-  }
-  if (shadowReview.status === "error") {
-    return { label: "Shadow run failed", tone: "warn" };
-  }
-  const agreement = shadowReview.decision_agreement_rate ?? 0;
-  const precision = shadowReview.precision_proxy ?? 0;
-  const recall = shadowReview.recall_proxy ?? 0;
-  const meanDelta = shadowReview.mean_score_delta ?? 0;
-  if (agreement >= 0.8 && precision >= 0.7 && recall >= 0.7 && meanDelta >= -0.15) {
-    return { label: "Healthy candidate reviewers", tone: "good" };
-  }
-  return { label: "Candidate reviewers need tuning", tone: "warn" };
-}
-
 export function RightPanel({
-  syncStatus,
-  connector,
-  filesCount = 0,
   isReviewing = false,
   reviewResults = [],
   reviewSummary,
@@ -169,120 +97,28 @@ export function RightPanel({
   runningJudgeId = null,
   onAnnotationClick,
   onToggleJudgeVisibility,
-  shadowReview,
-  onRunShadowReview,
-  rolloutMode = "baseline",
-  rolloutHistory = [],
-  onOpenRolloutHistory,
-  onRecoverToActive,
-  isRecoveringToActive = false,
-  onSetRolloutMode,
-  decisionLog = [],
-  escalation = null,
-  capacity = null,
+  lastCommandTrace = null,
+  commentThreads = [],
+  activeThreadId = null,
+  onSelectThread,
+  onAcceptThreadSuggestion,
+  onRejectThreadSuggestion,
+  onRevertThreadSuggestion,
+  onResolveThread,
   crewDoers = [],
   crewReviewers = [],
 }: RightPanelProps) {
-  const hasResults = reviewResults.length > 0;
-  const connectorName = connectorLabel(connector);
-  const rolloutEvents = rolloutHistory.slice(-5).reverse();
-  const latestAutoFallback = rolloutEvents.find((event) => event.source === "auto_fallback");
   const enabledDoers = crewDoers.filter((member) => member.enabled);
-  const enabledCrewReviewers = crewReviewers.filter((member) => member.enabled);
-  const [expandedCrewItem, setExpandedCrewItem] = useState<string | null>(null);
-  const [expandedReviewerCritiqueId, setExpandedReviewerCritiqueId] = useState<string | null>(null);
+  const enabledReviewers = crewReviewers.filter((member) => member.enabled);
+  const hasResults = reviewResults.length > 0;
   const reviewerResultById = new Map(reviewResults.map((result) => [result.judgeId, result]));
-  const sourceConfidence = deriveSourceConfidence(reviewResults);
-  const evidenceWarningCount = countEvidenceWarnings(reviewResults);
-  const concordiaStatus = concordiaHealthLabel(shadowReview);
-  const recentDecisions = decisionLog.slice(0, 4);
+  const openThreads = commentThreads.filter((thread) => thread.status === "open");
+  const [expandedReviewerNotesId, setExpandedReviewerNotesId] = useState<string | null>(null);
 
   return (
     <div className="w-72 flex-shrink-0 border-l border-[var(--glass-border)] bg-[var(--carbon)]/50 flex flex-col overflow-hidden">
-      {/* Sync Status */}
       <Panel
-        className="border-0 border-b border-[var(--glass-border)]"
-        header={
-          <PanelHeader
-            title="Files"
-            icon={
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" />
-              </svg>
-            }
-            action={
-              <StatusIndicator
-                status={syncStatus === "done" ? "ready" : syncStatus === "syncing" ? "syncing" : "idle"}
-              />
-            }
-          />
-        }
-      >
-        {syncStatus === "idle" && !connector && (
-          <div className="text-center py-4">
-            <div className="text-[var(--ash)] text-xs mb-2">No connector selected</div>
-            <div className="text-[10px] text-[var(--zinc)]">Choose a source to start syncing</div>
-          </div>
-        )}
-
-        {syncStatus === "syncing" && (
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <span className="status-dot status-dot-syncing" />
-              <span className="text-xs text-[var(--amber)]">
-                Gathering files from {connectorName}...
-              </span>
-            </div>
-            <div className="space-y-2">
-              <div className="flex justify-between text-[10px] font-mono">
-                <span className="text-[var(--smoke)]">Files found</span>
-                <span className="text-[var(--pearl)]">{filesCount}</span>
-              </div>
-              <div className="h-1 bg-[var(--graphite)] overflow-hidden">
-                <div
-                  className="h-full bg-[var(--amber)] transition-all animate-pulse-glow"
-                  style={{ width: "60%" }}
-                />
-              </div>
-            </div>
-            <div className="text-[10px] font-mono text-[var(--ash)]">
-              We&apos;ll ping you when ready
-            </div>
-          </div>
-        )}
-
-        {syncStatus === "done" && (
-          <div className="space-y-3">
-            {filesCount > 0 ? (
-              <>
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2">
-                    <span className="status-dot status-dot-ready" />
-                    <span className="text-xs text-[var(--phosphor)]">
-                      All set!
-                    </span>
-                  </div>
-                  <Badge variant="phosphor">{filesCount} {filesCount === 1 ? 'file' : 'files'}</Badge>
-                </div>
-                <div className="text-[10px] font-mono text-[var(--smoke)]">
-                  Press Cmd+K to start
-                </div>
-              </>
-            ) : (
-              <div className="text-center py-4">
-                <div className="text-[var(--ash)] text-xs mb-2">No files found</div>
-                <div className="text-[10px] text-[var(--zinc)]">
-                  Connect a folder with documents to get started
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </Panel>
-
-      {/* Crew */}
-      <Panel
-        className="border-0 border-b border-[var(--glass-border)] max-h-[40vh] overflow-auto"
+        className="border-0 border-b border-[var(--glass-border)] max-h-[45vh] overflow-auto"
         header={
           <PanelHeader
             title="Crew"
@@ -296,137 +132,105 @@ export function RightPanel({
           />
         }
       >
-        {enabledDoers.length === 0 && enabledCrewReviewers.length === 0 ? (
-          <div className="text-center py-4">
-            <div className="text-[var(--ash)] text-xs mb-1">No crew assigned yet</div>
-            <div className="text-[10px] text-[var(--zinc)]">Generate doers and reviewers in project setup</div>
-          </div>
+        {enabledDoers.length === 0 && enabledReviewers.length === 0 ? (
+          <p className="text-[10px] text-[var(--ash)]">No crew assigned yet.</p>
         ) : (
           <div className="space-y-3">
-            <div className="rounded-md border border-[var(--phosphor)]/30 bg-[var(--phosphor-glow)] px-2 py-1.5 text-[10px] text-[var(--smoke)]">
-              Crew stack: {enabledDoers.length} doer{enabledDoers.length === 1 ? "" : "s"} +{" "}
-              {enabledCrewReviewers.length} reviewer{enabledCrewReviewers.length === 1 ? "" : "s"}
-            </div>
-
             <div>
-              <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">Reviewers</div>
+              <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
+                Reviewers
+              </div>
               <div className="space-y-1.5">
-                {enabledCrewReviewers.length === 0 ? (
+                {enabledReviewers.length === 0 ? (
                   <p className="text-[10px] text-[var(--ash)]">No active reviewers.</p>
                 ) : (
-                  enabledCrewReviewers.map((reviewer) => (
-                    <div
-                      key={reviewer.id}
-                      className="rounded-md border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1.5"
-                    >
-                      <div className="flex items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={() =>
-                            setExpandedCrewItem((current) =>
-                              current === `reviewer:${reviewer.id}` ? null : `reviewer:${reviewer.id}`
-                            )
-                          }
-                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                        >
+                  enabledReviewers.map((reviewer) => {
+                    const reviewerResult = reviewerResultById.get(reviewer.id);
+                    const noteCount = reviewerResult?.annotations.length || 0;
+                    return (
+                      <div
+                        key={reviewer.id}
+                        className="rounded-md border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1.5"
+                      >
+                        <div className="flex items-start gap-2">
                           <span className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full border border-[var(--zinc)]/70 bg-[var(--carbon)] text-sm">
-                            {crewEmoji(reviewer.id, reviewer.name, "reviewer")}
+                            {memberEmoji(reviewer.id, reviewer.name, "reviewer")}
                           </span>
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-xs text-[var(--pearl)]">{reviewer.name}</span>
-                            <span className="block truncate text-[10px] text-[var(--ash)]">
-                              {summarizeCrewRole(reviewer, "reviewer")}
-                            </span>
-                          </span>
-                        </button>
-                        <div className="flex items-center gap-1">
-                          {reviewerResultById.get(reviewer.id) && (
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setExpandedReviewerCritiqueId((current) =>
-                                  current === reviewer.id ? null : reviewer.id
-                                );
-                                if (!visibleJudgeIds.has(reviewer.id)) {
-                                  onToggleJudgeVisibility?.(reviewer.id);
-                                }
-                              }}
-                              className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
-                              aria-label={`View ${reviewer.name} critique`}
-                              title="View critique"
-                            >
-                              Notes
-                            </button>
-                          )}
+                          <div className="min-w-0 flex-1">
+                            <div className="truncate text-xs text-[var(--pearl)]">{reviewer.name}</div>
+                            <div className="truncate text-[10px] text-[var(--ash)]">
+                              {memberSubtitle(reviewer, "reviewer")}
+                            </div>
+                          </div>
+                        </div>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1">
                           <button
                             type="button"
                             onClick={() => onRunSingleReview?.(reviewer.id)}
-                            className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
+                            disabled={runningJudgeId === reviewer.id}
+                            className="rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)] disabled:opacity-60"
                             aria-label={`Run ${reviewer.name} review`}
-                            title={`Run ${reviewer.name}`}
                           >
-                            Run
+                            {runningJudgeId === reviewer.id ? "Running..." : "Run"}
                           </button>
                           <button
                             type="button"
                             onClick={() => onToggleJudgeVisibility?.(reviewer.id)}
-                            className="inline-flex h-7 items-center gap-1 rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
+                            className="rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
                             aria-label={`${visibleJudgeIds.has(reviewer.id) ? "Hide" : "Show"} ${reviewer.name} highlights`}
-                            title={visibleJudgeIds.has(reviewer.id) ? "Hide highlights" : "Show highlights"}
                           >
                             {visibleJudgeIds.has(reviewer.id) ? "Hide" : "Show"}
                           </button>
-                        </div>
-                      </div>
-                      {expandedCrewItem === `reviewer:${reviewer.id}` && (
-                        <div className="mt-2 border-t border-[var(--zinc)]/50 pt-2">
-                          <p className="text-[10px] leading-relaxed text-[var(--smoke)]">
-                            {reviewer.description || reviewer.reason}
-                          </p>
-                          <div className="mt-1 flex items-center gap-2 text-[10px] text-[var(--ash)]">
-                            <span>Strictness: {reviewer.strictness || "medium"}</span>
-                            {reviewerResultById.get(reviewer.id) && (
-                              <span>
-                                Score {reviewerResultById.get(reviewer.id)?.score.toFixed(1)} ·{" "}
-                                {reviewerResultById.get(reviewer.id)?.annotations.length || 0} highlights
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      )}
-                      {expandedReviewerCritiqueId === reviewer.id && reviewerResultById.get(reviewer.id) && (
-                        <div className="mt-2 rounded border border-[var(--zinc)]/40 bg-[var(--carbon)] px-2 py-1.5">
-                          <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--ash)]">
-                            Latest Critique
-                          </div>
-                          {reviewerResultById.get(reviewer.id)?.annotations.length ? (
-                            <div className="space-y-1">
-                              {reviewerResultById.get(reviewer.id)?.annotations.slice(0, 3).map((annotation) => (
-                                <button
-                                  key={annotation.id}
-                                  type="button"
-                                  onClick={() => onAnnotationClick?.(annotation.id)}
-                                  className="w-full text-left text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
-                                >
-                                  - {annotation.message}
-                                </button>
-                              ))}
-                            </div>
-                          ) : (
-                            <p className="text-[10px] text-[var(--smoke)]">
-                              No issues flagged in the latest run.
-                            </p>
+                          {reviewerResult && (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedReviewerNotesId((current) =>
+                                  current === reviewer.id ? null : reviewer.id
+                                )
+                              }
+                              className="rounded border border-[var(--zinc)]/80 bg-[var(--carbon)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:border-[var(--phosphor)]/40 hover:text-[var(--phosphor)]"
+                              aria-label={`View ${reviewer.name} critique`}
+                            >
+                              Notes ({noteCount})
+                            </button>
                           )}
                         </div>
-                      )}
-                    </div>
-                  ))
+                        {expandedReviewerNotesId === reviewer.id && reviewerResult && (
+                          <div className="mt-1.5 rounded border border-[var(--zinc)]/40 bg-[var(--carbon)] px-2 py-1.5">
+                            {reviewerResult.annotations.length > 0 ? (
+                              <div className="space-y-1">
+                                {reviewerResult.annotations.slice(0, 4).map((annotation) => (
+                                  <button
+                                    key={annotation.id}
+                                    type="button"
+                                    onClick={() => onAnnotationClick?.(annotation.id)}
+                                    className={`w-full text-left text-[10px] ${
+                                      annotation.id === activeAnnotationId
+                                        ? "text-[var(--pearl)]"
+                                        : "text-[var(--smoke)] hover:text-[var(--pearl)]"
+                                    }`}
+                                  >
+                                    L{annotation.startLine}: {annotation.message}
+                                  </button>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-[10px] text-[var(--ash)]">No issues in latest run.</p>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })
                 )}
               </div>
             </div>
 
             <div>
-              <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">Doers</div>
+              <div className="mb-1 text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
+                Doers
+              </div>
               <div className="space-y-1.5">
                 {enabledDoers.length === 0 ? (
                   <p className="text-[10px] text-[var(--ash)]">No active doers.</p>
@@ -436,33 +240,17 @@ export function RightPanel({
                       key={doer.id}
                       className="rounded-md border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1.5"
                     >
-                      <button
-                        type="button"
-                        onClick={() =>
-                          setExpandedCrewItem((current) =>
-                            current === `doer:${doer.id}` ? null : `doer:${doer.id}`
-                          )
-                        }
-                        className="flex w-full items-center gap-2 text-left"
-                      >
+                      <div className="flex items-start gap-2">
                         <span className="inline-flex h-7 w-7 flex-shrink-0 items-center justify-center rounded-full border border-[var(--zinc)]/70 bg-[var(--carbon)] text-sm">
-                          {crewEmoji(doer.id, doer.name, "doer")}
+                          {memberEmoji(doer.id, doer.name, "doer")}
                         </span>
-                        <span className="min-w-0 flex-1">
-                          <span className="block truncate text-xs text-[var(--pearl)]">{doer.name}</span>
-                          <span className="block truncate text-[10px] text-[var(--ash)]">
-                            {summarizeCrewRole(doer, "doer")}
-                          </span>
-                        </span>
-                      </button>
-                      {expandedCrewItem === `doer:${doer.id}` && (
-                        <div className="mt-2 border-t border-[var(--zinc)]/50 pt-2">
-                          <p className="text-[10px] leading-relaxed text-[var(--smoke)]">{doer.description}</p>
-                          <div className="mt-1 text-[10px] text-[var(--ash)]">
-                            Strictness: {doer.strictness || "medium"}
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-xs text-[var(--pearl)]">{doer.name}</div>
+                          <div className="truncate text-[10px] text-[var(--ash)]">
+                            {memberSubtitle(doer, "doer")}
                           </div>
                         </div>
-                      )}
+                      </div>
                     </div>
                   ))
                 )}
@@ -472,16 +260,15 @@ export function RightPanel({
         )}
       </Panel>
 
-      {/* Reviewers */}
       <Panel
-        className="border-0 border-b border-[var(--glass-border)] flex-1 overflow-auto"
+        className="border-0 border-b border-[var(--glass-border)] max-h-[35vh] overflow-auto"
         header={
           <PanelHeader
-            title="Review Results"
+            title="Review"
             icon={
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" />
-                <path d="M14 2v6h6M9 15l2 2 4-4" />
+                <path d="M9 12l2 2 4-4" />
+                <path d="M21 12c0 5-4 9-9 9s-9-4-9-9 4-9 9-9 9 4 9 9z" />
               </svg>
             }
             action={
@@ -490,322 +277,184 @@ export function RightPanel({
                   Clear
                 </Button>
               ) : (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  onClick={onRunReview}
-                  disabled={isReviewing}
-                >
-                  {isReviewing ? (
-                    <span className="flex items-center gap-1.5">
-                      <span className="status-dot status-dot-working w-1.5 h-1.5" />
-                      Reviewing...
-                    </span>
-                  ) : (
-                    "Run Review"
-                  )}
+                <Button variant="ghost" size="sm" onClick={onRunReview} disabled={isReviewing}>
+                  {isReviewing ? "Reviewing..." : "Run Review"}
                 </Button>
               )
             }
           />
         }
       >
-        {/* Review summary */}
         {reviewSummary && (
-          <div className="mb-3 pb-3 border-b border-[var(--glass-border)]">
-            <div className="flex items-center justify-between mb-1.5">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
-                Overall
-              </span>
-              <span className="text-sm font-semibold text-[var(--pearl)]">
-                {reviewSummary.overallScore.toFixed(1)}/10
-              </span>
-            </div>
-            <div className="mb-1.5 flex items-center gap-2 text-[10px]">
-              <span className="text-[var(--ash)]">Source Confidence:</span>
-              <span
-                className={
-                  sourceConfidence === "High"
-                    ? "text-[var(--phosphor)]"
-                    : sourceConfidence === "Medium"
-                      ? "text-[var(--amber)]"
-                      : "text-[var(--coral)]"
-                }
-              >
-                {sourceConfidence}
-              </span>
-            </div>
-            <div className="flex items-center gap-2 text-[10px] font-mono text-[var(--ash)]">
-              <span>{reviewSummary.totalIssues} issues</span>
-              {reviewSummary.conflictsDetected > 0 && (
-                <>
-                  <span className="text-[var(--zinc)]">·</span>
-                  <span className="text-[var(--amber)]">
-                    {reviewSummary.conflictsDetected} conflicts
-                  </span>
-                </>
-              )}
-            </div>
-            {evidenceWarningCount > 0 && (
-              <div className="mt-1 text-[10px] text-[var(--amber)]">
-                {evidenceWarningCount} evidence/source warning{evidenceWarningCount === 1 ? "" : "s"} require review.
-              </div>
-            )}
-            <div className="mt-1 text-[10px] text-[var(--ash)]">
-              Tip: click a reviewer note to jump to the exact line in the editor.
-            </div>
-          </div>
+          <p className="mb-2 text-[10px] text-[var(--smoke)]">
+            Score {reviewSummary.overallScore.toFixed(1)}/10, {reviewSummary.totalIssues} issues.
+          </p>
         )}
 
-        <div className="mb-3 pb-3 border-b border-[var(--glass-border)]">
-          <div className="mb-1.5 flex items-center justify-between">
-            <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
-              Ops Rails
-            </span>
-            <span
-              className={`text-[10px] ${
-                escalation?.status === "open"
-                  ? escalation.level === "L2"
-                    ? "text-[var(--coral)]"
-                    : "text-[var(--amber)]"
-                  : "text-[var(--phosphor)]"
-              }`}
-            >
-              {escalation?.status === "open" ? `${escalation.level} Open` : "Stable"}
-            </span>
-          </div>
-          <div className="space-y-1 text-[10px] text-[var(--smoke)]">
-            <div className="flex items-center justify-between">
-              <span className="text-[var(--ash)]">Reviewer budget</span>
-              <span>
-                {(capacity?.reviewerRunsCurrentDraft ?? 0)}/{capacity?.maxReviewerRunsPerDraft ?? 5}
-              </span>
-            </div>
-            <div className="flex items-center justify-between">
-              <span className="text-[var(--ash)]">Queue depth</span>
-              <span>{capacity?.queueDepth ?? 0}</span>
-            </div>
-            {escalation?.status === "open" && (
-              <p className="text-[var(--amber)]">
-                {escalation.reason} Recommended: {escalation.recommended_action}
-              </p>
-            )}
-          </div>
-          {recentDecisions.length > 0 && (
-            <div className="mt-2 border-t border-[var(--zinc)]/50 pt-2">
-              <div className="mb-1 text-[10px] text-[var(--ash)]">Latest decisions</div>
-              <div className="space-y-1">
-                {recentDecisions.map((event) => (
-                  <div key={event.id} className="rounded border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1">
-                    <div className="flex items-center justify-between text-[10px] text-[var(--smoke)]">
-                      <span>{decisionTypeLabel(event.decision_type)}</span>
-                      <span className="text-[var(--ash)]">{formatRolloutTime(event.timestamp)}</span>
-                    </div>
-                    <div className="text-[10px] text-[var(--ash)]">{event.reason}</div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+        <div className="mb-2 flex items-center justify-between">
+          <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">Threads</span>
+          <span className="text-[10px] text-[var(--ash)]">{openThreads.length} open</span>
         </div>
-
-        {/* Shadow comparison */}
-        {onRunShadowReview && (
-          <div className="mb-3 pb-3 border-b border-[var(--glass-border)]">
-            <div className="mb-2">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
-                Rollout Mode
-              </span>
-              <div className="mt-1 flex gap-1">
-                {(["baseline", "shadow", "active"] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    onClick={() => onSetRolloutMode?.(mode)}
-                    className={`
-                      px-2 py-1 text-[10px] uppercase tracking-[0.08em] border transition-colors
-                      ${rolloutMode === mode
-                        ? "bg-[var(--phosphor-glow)] border-[var(--phosphor)]/40 text-[var(--phosphor)]"
-                        : "bg-[var(--graphite)] border-[var(--zinc)] text-[var(--ash)] hover:text-[var(--smoke)]"
-                      }
-                    `}
-                  >
-                    {mode}
-                  </button>
-                ))}
-              </div>
-              {(rolloutMode === "active" || rolloutMode === "shadow") && (
-                <button
-                  onClick={() => onSetRolloutMode?.("baseline")}
-                  className="mt-1 text-[10px] text-[var(--coral)] hover:underline"
-                >
-                  Roll back to baseline
-                </button>
-              )}
-            </div>
-            <div className="mb-2 flex items-center justify-between">
-              <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
-                Shadow Concordia
-              </span>
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={onRunShadowReview}
-                disabled={shadowReview?.status === "running"}
-              >
-                {shadowReview?.status === "running" ? "Running..." : "Run Shadow Review"}
-              </Button>
-            </div>
-            <div className="mb-2 flex items-center gap-2 text-[10px]">
-              <span className="text-[var(--ash)]">Status:</span>
-              <span
-                className={
-                  concordiaStatus.tone === "good"
-                    ? "text-[var(--phosphor)]"
-                    : concordiaStatus.tone === "warn"
-                      ? "text-[var(--amber)]"
-                      : "text-[var(--smoke)]"
-                }
-              >
-                {concordiaStatus.label}
-              </span>
-            </div>
-            <p className="mb-2 text-[10px] text-[var(--ash)]">
-              Concordia compares baseline and candidate reviewer paths, then automatically reverts to baseline when quality drops.
-            </p>
-            <div className="mb-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5 text-[10px] text-[var(--smoke)]">
-              1) Run shadow review 2) Compare agreement/precision/recall 3) Promote or stay on baseline.
-            </div>
-            {!shadowReview || shadowReview.status === "idle" ? (
-              <p className="text-[10px] text-[var(--ash)]">
-                Compare baseline and candidate reviewer outputs silently.
-              </p>
-            ) : shadowReview.status === "error" ? (
-              <p className="text-[10px] text-[var(--coral)]">
-                Shadow run failed: {shadowReview.error || "unknown error"}
-              </p>
-            ) : (
-              <div className="space-y-1.5 text-[10px] text-[var(--smoke)]">
-                <div className="flex items-center justify-between">
-                  <span>Decision agreement</span>
-                  <span className="text-[var(--pearl)]">
-                    {Math.round((shadowReview.decision_agreement_rate || 0) * 100)}%
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Precision proxy</span>
-                  <span className="text-[var(--pearl)]">
-                    {Math.round((shadowReview.precision_proxy || 0) * 100)}%
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Recall proxy</span>
-                  <span className="text-[var(--pearl)]">
-                    {Math.round((shadowReview.recall_proxy || 0) * 100)}%
-                  </span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span>Avg score delta</span>
-                  <span className="text-[var(--pearl)]">
-                    {(shadowReview.mean_score_delta || 0).toFixed(2)}
-                  </span>
-                </div>
-              </div>
-            )}
-
-            <div className="mt-3 border-t border-[var(--glass-border)] pt-2">
-              <div className="mb-1 flex items-center justify-between">
-                <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--smoke)]">
-                  Rollout Timeline
-                </span>
-                <span className="text-[10px] text-[var(--ash)]">{rolloutHistory.length} events</span>
-              </div>
-              {latestAutoFallback && (
-                <div className="mb-2 border border-[var(--coral)]/40 bg-[var(--coral)]/10 px-2 py-1 text-[10px] text-[var(--coral)]">
-                  Auto fallback at {formatRolloutTime(latestAutoFallback.updated_at)}.
-                </div>
-              )}
-              {rolloutEvents.length === 0 ? (
-                <p className="text-[10px] text-[var(--ash)]">No rollout events recorded yet.</p>
-              ) : (
-                <div className="space-y-1">
-                  {rolloutEvents.map((event) => (
-                    <div
-                      key={`${event.updated_at}-${event.mode}-${event.source}`}
-                      className="border border-[var(--zinc)]/40 bg-[var(--graphite)] px-2 py-1 text-[10px]"
-                    >
-                      <div className="flex items-center justify-between text-[var(--pearl)]">
-                        <span>{event.mode}</span>
-                        <span className="text-[var(--ash)]">{formatRolloutTime(event.updated_at)}</span>
-                      </div>
-                      <div className="text-[var(--smoke)]">{rolloutSourceLabel(event.source)}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div className="mt-2 flex items-center gap-2">
-                <Button variant="ghost" size="sm" onClick={onOpenRolloutHistory}>
-                  View Full History
-                </Button>
-                {latestAutoFallback && rolloutMode !== "active" && (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={onRecoverToActive}
-                    disabled={isRecoveringToActive}
-                  >
-                    {isRecoveringToActive ? "Recovering..." : "Recover to Active"}
-                  </Button>
-                )}
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* Reviewer cards */}
-        {hasResults ? (
-          <div className="space-y-3">
-            {reviewResults.map((result) => (
-              <ReviewerCard
-                key={result.judgeId}
-                result={result}
-                isVisible={visibleJudgeIds.has(result.judgeId)}
-                isRunning={runningJudgeId === result.judgeId}
-                onToggleVisibility={() => onToggleJudgeVisibility?.(result.judgeId)}
-                onRun={() => onRunSingleReview?.(result.judgeId)}
-                onAnnotationClick={(id) => onAnnotationClick?.(id)}
-                activeAnnotationId={activeAnnotationId ?? null}
-              />
-            ))}
-          </div>
-        ) : !isReviewing ? (
-          <div className="text-center py-6">
-            <div className="text-[var(--ash)] text-xs mb-1">No review yet</div>
-            <div className="text-[10px] text-[var(--zinc)]">
-              Write a draft and run a review
-            </div>
-            {onRunReview && (
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={onRunReview}
-                className="mt-3"
-              >
-                Run First Review
-              </Button>
-            )}
-          </div>
+        {openThreads.length === 0 ? (
+          <p className="text-[10px] text-[var(--ash)]">No active reviewer threads.</p>
         ) : (
-          <div className="text-center py-6">
-            <div className="flex items-center justify-center gap-2 mb-2">
-              <span className="status-dot status-dot-working" />
-              <span className="text-xs text-[var(--amber)]">Running reviewers...</span>
-            </div>
-            <div className="text-[10px] text-[var(--zinc)]">
-              This may take a few seconds. Reviewers are checking facts, clarity, and risk.
-            </div>
+          <div className="space-y-1.5">
+            {openThreads.slice(0, 8).map((thread) => (
+              <div
+                key={thread.id}
+                className={`rounded border px-2 py-1.5 ${
+                  activeThreadId === thread.id
+                    ? "border-[var(--phosphor)]/40 bg-[var(--phosphor-glow)]"
+                    : "border-[var(--zinc)]/40 bg-[var(--graphite)]"
+                }`}
+              >
+                <button type="button" onClick={() => onSelectThread?.(thread.id)} className="w-full text-left">
+                  <div className="flex items-center justify-between">
+                    <span className="truncate text-[11px] text-[var(--pearl)]">{thread.judge_name || "Reviewer"}</span>
+                    <span className="text-[10px] text-[var(--ash)]">L{thread.anchor.startLine}</span>
+                  </div>
+                  <div className="truncate text-[10px] text-[var(--smoke)]">{thread.messages[0]?.body || "Comment"}</div>
+                </button>
+                <div className="mt-1 flex flex-wrap items-center gap-1">
+                  {thread.suggestion?.status === "pending" && (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => onAcceptThreadSuggestion?.(thread.id)}
+                        className="rounded border border-[var(--zinc)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
+                      >
+                        Accept
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRejectThreadSuggestion?.(thread.id)}
+                        className="rounded border border-[var(--zinc)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
+                      >
+                        Reject
+                      </button>
+                    </>
+                  )}
+                  {thread.suggestion?.status === "accepted" && (
+                    <button
+                      type="button"
+                      onClick={() => onRevertThreadSuggestion?.(thread.id)}
+                      className="rounded border border-[var(--zinc)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
+                    >
+                      Revert
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => onResolveThread?.(thread.id)}
+                    className="rounded border border-[var(--zinc)] px-1.5 py-0.5 text-[10px] text-[var(--smoke)] hover:text-[var(--pearl)]"
+                  >
+                    Resolve
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </Panel>
+
+      {lastCommandTrace && (
+        <Panel
+          className="border-0 flex-1 overflow-auto"
+          header={
+            <PanelHeader
+              title="Last Run"
+              icon={
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <circle cx="12" cy="12" r="9" />
+                  <path d="M12 7v5l3 3" />
+                </svg>
+              }
+            />
+          }
+        >
+          <p className="text-[10px] text-[var(--ash)]">{formatTime(lastCommandTrace.created_at)}</p>
+          {lastCommandTrace.trace_id ? (
+            <p className="mt-1 text-[10px] text-[var(--ash)]">Trace: {lastCommandTrace.trace_id}</p>
+          ) : null}
+          <p className="mt-1 text-[10px] text-[var(--smoke)]">{lastCommandTrace.answer_preview || "No preview."}</p>
+          <div className="mt-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5">
+            <p className="text-[10px] text-[var(--smoke)]">
+              Docs read: {lastCommandTrace.context_file_count}
+            </p>
+            {lastCommandTrace.context_file_summaries && lastCommandTrace.context_file_summaries.length > 0 ? (
+              <div className="mt-1 space-y-1">
+                {lastCommandTrace.context_file_summaries.slice(0, 6).map((item) => (
+                  <div key={item.filename} className="text-[10px] text-[var(--ash)]">
+                    <span className="text-[var(--smoke)]">{item.filename}</span>
+                    {item.preview ? ` - ${item.preview}` : ""}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-1 text-[10px] text-[var(--ash)]">No file context was attached.</p>
+            )}
+          </div>
+
+          <div className="mt-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5">
+            <p className="text-[10px] text-[var(--smoke)]">
+              Tool calls: {lastCommandTrace.tool_calls?.length ?? 0}
+            </p>
+            {lastCommandTrace.tool_calls && lastCommandTrace.tool_calls.length > 0 ? (
+              <div className="mt-1 space-y-1">
+                {lastCommandTrace.tool_calls.slice(0, 10).map((call, idx) => (
+                  <div key={`${call.tool_name}-${idx}`} className="text-[10px] text-[var(--ash)]">
+                    {call.tool_name} [{call.source}]
+                    {call.file ? ` ${call.file}` : ""}
+                    {typeof call.bytes_read === "number" ? ` (${call.bytes_read})` : ""}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-1 text-[10px] text-[var(--ash)]">No tool activity recorded.</p>
+            )}
+          </div>
+
+          <div className="mt-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5">
+            <p className="text-[10px] text-[var(--smoke)]">
+              Citations: {lastCommandTrace.citations?.length ?? 0}
+            </p>
+            {lastCommandTrace.citations && lastCommandTrace.citations.length > 0 ? (
+              <div className="mt-1 space-y-1.5">
+                {lastCommandTrace.citations.slice(0, 8).map((citation, idx) => (
+                  <div key={`${citation.filename}-${idx}`} className="rounded border border-[var(--zinc)]/40 px-1.5 py-1">
+                    <div className="text-[10px] text-[var(--pearl)]">
+                      {citation.filename}
+                      {citation.line_start ? ` (L${citation.line_start}${citation.line_end && citation.line_end !== citation.line_start ? `-${citation.line_end}` : ""})` : ""}
+                    </div>
+                    <div className="text-[10px] text-[var(--smoke)]">&quot;{citation.quote}&quot;</div>
+                    {citation.why ? <div className="text-[10px] text-[var(--ash)]">{citation.why}</div> : null}
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="mt-1 text-[10px] text-[var(--ash)]">No citation evidence returned.</p>
+            )}
+            {lastCommandTrace.evidence_gaps && lastCommandTrace.evidence_gaps.length > 0 ? (
+              <div className="mt-1 space-y-1">
+                {lastCommandTrace.evidence_gaps.slice(0, 4).map((gap, idx) => (
+                  <div key={`gap-${idx}`} className="text-[10px] text-[var(--amber)]">
+                    Gap: {gap}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+          </div>
+
+          {(lastCommandTrace.reasoning_summary || lastCommandTrace.reasoning) && (
+            <details className="mt-2 rounded border border-[var(--zinc)]/50 bg-[var(--graphite)] px-2 py-1.5">
+              <summary className="cursor-pointer text-[10px] text-[var(--smoke)]">Rationale</summary>
+              <p className="mt-1 whitespace-pre-wrap text-[10px] text-[var(--smoke)]">
+                {lastCommandTrace.reasoning_summary || lastCommandTrace.reasoning}
+              </p>
+            </details>
+          )}
+        </Panel>
+      )}
     </div>
   );
 }

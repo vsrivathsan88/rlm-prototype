@@ -42,7 +42,7 @@ export async function runReview(
   conflicts: BackendConflict[];
   llmMeta: BackendLlmRouteEvent[];
 }> {
-  const documentText = editor.getText();
+  const documentText = editor.getText({ blockSeparator: "\n" });
 
   if (!documentText.trim()) {
     throw new Error("Document is empty. Write something before running a review.");
